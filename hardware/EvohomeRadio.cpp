@@ -1075,7 +1075,7 @@ bool CEvohomeRadio::DecodeDHWState(CEvohomeMsg& msg)//1F41
 
 		tsen.zone = msg.payload[0] + 1;////NA to DHW...controller is 0 so let our zones start from 1...
 	tsen.updatetype = updSetPoint;//state
-	tsen.temperature = msg.payload[1];//just on or off for DHW
+	tsen.temperature = msg.payload[1] ? 6000 : 0;//just on or off for DHW
 	if (tsen.temperature == 0xFF)// temperature = 255 if DHW not installed
 		return true;
 	int nMode = ConvertMode(m_evoToDczOverrideMode, msg.payload[2]);
