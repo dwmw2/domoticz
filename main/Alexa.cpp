@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "WebServer.h"
+#include "SQLHelper.h"
 #include "Logger.h"
 #include "../webserver/cWebem.h"
 #include "../webserver/request.hpp"
@@ -107,6 +108,59 @@ void CWebServer::Alexa_HandleAcceptGrant(WebEmSession& session, const request& r
 	root["event"]["payload"] = Json::Value(Json::objectValue);
 }
 
+static void CreateErrorResponse(Json::Value& root, const Json::Value& request_json, const std::string& error_type, const std::string& error_message)
+{
+	root["event"]["header"]["namespace"] = "Alexa";
+	root["event"]["header"]["name"] = "ErrorResponse";
+	root["event"]["header"]["payloadVersion"] = "3";
+	root["event"]["header"]["messageId"] = request_json["directive"]["header"]["messageId"].asString();
+	root["event"]["payload"]["type"] = error_type;
+	root["event"]["payload"]["message"] = error_message;
+}
+
+static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx)
+{
+	// TODO: Query device state and return StateReport
+	CreateErrorResponse(root, request_json, "INTERNAL_ERROR", "ReportState not yet implemented");
+}
+
+static bool CheckDeviceAccess(CWebServer* server, const WebEmSession& session, uint64_t device_idx, bool& bControlPermitted)
+{
+	bControlPermitted = true;
+
+	switch (session.rights)
+	{
+	case URIGHTS_ADMIN:
+		// Admin can access anything
+		return true;
+
+	case URIGHTS_VIEWER:
+		bControlPermitted = false;
+		[[fallthrough]];
+
+	case URIGHTS_SWITCHER:
+	{
+		// Find user and check device permissions
+		int iUser = server->FindUser(session.username.c_str());
+		if ((iUser < 0) || (iUser >= (int)server->m_users.size()))
+			return false;
+
+		// If TotSensors is 0, user has access to all devices
+		if (server->m_users[iUser].TotSensors == 0)
+			return true;
+
+		// Check if device is in user's shared devices
+		std::vector<std::vector<std::string>> result =
+			m_sql.safe_query("SELECT COUNT(*) FROM SharedDevices WHERE (SharedUserID == '%d') AND (DeviceRowID == '%llu')", server->m_users[iUser].ID, device_idx);
+		return (!result.empty() && atoi(result[0][0].c_str()) > 0);
+	}
+
+	default:
+		// Invalid user rights
+		return false;
+	}
+}
+
 void CWebServer::Alexa_HandleControl(WebEmSession& session, const request& req, Json::Value& root)
 {
 	Json::Value request_json;
@@ -120,12 +174,74 @@ void CWebServer::Alexa_HandleControl(WebEmSession& session, const request& req, 
 		return;
 	}
 
+	std::string directive_namespace = request_json["directive"]["header"]["namespace"].asString();
+	std::string directive_name = request_json["directive"]["header"]["name"].asString();
+	std::string endpoint_id = request_json["directive"]["endpoint"]["endpointId"].asString();
+	Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
+
+	// Parse endpoint ID to determine device type and index
+	bool is_scene = false;
+	std::string device_idx_str = endpoint_id;
+
+	// Check for scene_ prefix
+	if (endpoint_id.find("scene_") == 0)
+	{
+		is_scene = true;
+		device_idx_str = endpoint_id.substr(6); // Remove "scene_" prefix
+	}
+	else
+	{
+		// Remove any other xxx_ prefix (e.g., selector_)
+		size_t underscore_pos = endpoint_id.find('_');
+		if (underscore_pos != std::string::npos)
+		{
+			device_idx_str = endpoint_id.substr(underscore_pos + 1);
+		}
+	}
+
+	uint64_t device_idx = std::stoull(device_idx_str);
+
+	// Check access control for devices (scenes don't have per-user access control)
+	if (!is_scene)
+	{
+		bool bControlPermitted;
+		if (!CheckDeviceAccess(this, session, device_idx, bControlPermitted))
+		{
+			CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device not found or access denied");
+			return;
+		}
+
+		// ReportState is allowed for read-only users
+		if (directive_namespace == "Alexa" && directive_name == "ReportState")
+		{
+			Alexa_HandleControl_ReportState(session, request_json, root, device_idx);
+			return;
+		}
+
+		// Control operations require write permission
+		if (!bControlPermitted)
+		{
+			CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device control not permitted");
+			return;
+		}
+	}
+
+	// Check if this is a ReportState request
+	if (directive_namespace == "Alexa" && directive_name == "ReportState")
+	{
+		// TODO: Query device state and return StateReport
+		CreateErrorResponse(root, request_json, "INTERNAL_ERROR", "ReportState not yet implemented");
+		return;
+	}
+
+	// Handle control directives (PowerController, BrightnessController, etc.)
+	// TODO: Implement control handlers
 	root["event"]["header"]["namespace"] = "Alexa";
 	root["event"]["header"]["name"] = "ErrorResponse";
 	root["event"]["header"]["payloadVersion"] = "3";
 	root["event"]["header"]["messageId"] = request_json["directive"]["header"]["messageId"].asString();
 	root["event"]["payload"]["type"] = "INTERNAL_ERROR";
-	root["event"]["payload"]["message"] = "Control not yet implemented";
+	root["event"]["payload"]["message"] = "Control not yet implemented: " + directive_namespace + "/" + directive_name;
 }
 
 void CWebServer::GetAlexaPage(WebEmSession& session, const request& req, reply& rep)
