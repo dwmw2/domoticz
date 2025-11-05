@@ -1,11 +1,15 @@
 #include "stdafx.h"
 #include "WebServer.h"
+#include "mainworker.h"
 #include "SQLHelper.h"
 #include "Logger.h"
+#include "Helper.h"
+#include "RFXNames.h"
 #include "../webserver/cWebem.h"
 #include "../webserver/request.hpp"
 #include "../webserver/reply.hpp"
 #include "../httpclient/HTTPClient.h"
+#include "../hardware/hardwaretypes.h"
 #include <json/json.h>
 #include <sstream>
 #include <string>
@@ -15,6 +19,102 @@ extern CLogger _log;
 namespace http {
 namespace server {
 
+static Json::Value CreateCapability(const std::string& intf)
+{
+	Json::Value capability;
+	capability["type"] = "AlexaInterface";
+	capability["interface"] = intf;
+	capability["version"] = "3";
+	return capability;
+}
+
+static Json::Value CreateCapabilityWithProperties(const std::string& intf, const std::string& property_name, bool proactivelyReported, bool retrievable)
+{
+	Json::Value capability = CreateCapability(intf);
+	capability["properties"]["supported"] = Json::Value(Json::arrayValue);
+	Json::Value prop;
+	prop["name"] = property_name;
+	capability["properties"]["supported"].append(prop);
+	capability["properties"]["proactivelyReported"] = proactivelyReported;
+	capability["properties"]["retrievable"] = retrievable;
+	return capability;
+}
+
+static Json::Value CreateEndpoint(const std::string& endpoint_id, const std::string& friendly_name, const std::string& description, const std::string& display_category)
+{
+	Json::Value endpoint;
+	endpoint["endpointId"] = endpoint_id;
+	endpoint["manufacturerName"] = "Domoticz";
+	endpoint["friendlyName"] = friendly_name;
+	endpoint["description"] = description;
+	endpoint["displayCategories"] = Json::Value(Json::arrayValue);
+	endpoint["displayCategories"].append(display_category);
+	return endpoint;
+}
+
+static std::string GetISO8601Timestamp()
+{
+	time_t now = mytime(nullptr);
+	struct tm tm1;
+#ifdef WIN32
+	gmtime_s(&tm1, &now);
+#else
+	gmtime_r(&now, &tm1);
+#endif
+	char szTmp[80];
+	strftime(szTmp, sizeof(szTmp), "%Y-%m-%dT%H:%M:%SZ", &tm1);
+	return std::string(szTmp);
+}
+
+static Json::Value CreateProperty(const std::string& ns, const std::string& name, const Json::Value& value, const std::string& instance = "")
+{
+	Json::Value prop;
+	prop["namespace"] = ns;
+	if (!instance.empty())
+		prop["instance"] = instance;
+	prop["name"] = name;
+	prop["value"] = value;
+	prop["timeOfSample"] = GetISO8601Timestamp();
+	prop["uncertaintyInMilliseconds"] = 500;
+	return prop;
+}
+
+static Json::Value CreateEndpointHealthProperty()
+{
+	Json::Value health_value;
+	health_value["value"] = "OK";
+	Json::Value health = CreateProperty("Alexa.EndpointHealth", "connectivity", health_value);
+	health["uncertaintyInMilliseconds"] = 0;
+	return health;
+}
+
+static void CreateErrorResponse(Json::Value& root, const Json::Value& request_json, const std::string& error_type, const std::string& error_message)
+{
+	root["event"]["header"]["namespace"] = "Alexa";
+	root["event"]["header"]["name"] = "ErrorResponse";
+	root["event"]["header"]["payloadVersion"] = "3";
+	if (request_json.isMember("directive") && request_json["directive"].isMember("header") && request_json["directive"]["header"].isMember("messageId"))
+		root["event"]["header"]["messageId"] = request_json["directive"]["header"]["messageId"].asString();
+	root["event"]["payload"]["type"] = error_type;
+	root["event"]["payload"]["message"] = error_message;
+}
+
+static Json::Value CreateFriendlyNames(const std::string& text)
+{
+	Json::Value names = Json::Value(Json::arrayValue);
+	Json::Value name_us;
+	name_us["@type"] = "text";
+	name_us["value"]["locale"] = "en-US";
+	name_us["value"]["text"] = text;
+	names.append(name_us);
+	Json::Value name_gb;
+	name_gb["@type"] = "text";
+	name_gb["value"]["locale"] = "en-GB";
+	name_gb["value"]["text"] = text;
+	names.append(name_gb);
+	return names;
+}
+
 void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req, Json::Value& root)
 {
 	Json::Value request_json;
@@ -22,9 +122,7 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 	if (!reader.parse(req.content, request_json))
 	{
 		root["event"]["header"]["namespace"] = "Alexa";
-		root["event"]["header"]["name"] = "ErrorResponse";
-		root["event"]["payload"]["type"] = "INVALID_DIRECTIVE";
-		root["event"]["payload"]["message"] = "Invalid JSON";
+		CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "Invalid JSON");
 		return;
 	}
 
@@ -35,7 +133,52 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 	root["event"]["header"]["messageId"] = request_json["directive"]["header"]["messageId"].asString();
 	root["event"]["payload"]["endpoints"] = Json::Value(Json::arrayValue);
 
-	// TODO: Query devices and scenes directly from database
+	// TODO: Add device enumeration
+
+	// Get scenes/groups that are in room plans and not protected
+	std::vector<std::vector<std::string>> scenes_result;
+	scenes_result = m_sql.safe_query(
+		"SELECT s.ID, s.Name, s.SceneType, s.Protected "
+		"FROM Scenes s "
+		"INNER JOIN DeviceToPlansMap d ON s.ID = d.DeviceRowID AND d.DevSceneType = 1 "
+		"WHERE s.Protected = 0 "
+		"ORDER BY s.Name");
+
+	for (const auto& scene_row : scenes_result)
+	{
+		std::string scene_idx = scene_row[0];
+		int scene_type = atoi(scene_row[2].c_str());
+
+		Json::Value endpoint = CreateEndpoint("scene_" + scene_idx, scene_row[1], (scene_type == 0) ? "Scene" : "Group", (scene_type == 0) ? "SCENE_TRIGGER" : "SWITCH");
+
+		// Scenes use SceneController, Groups use PowerController
+		if (scene_type == 0) // Scene
+		{
+			// Add SceneController capability
+			Json::Value scene_capability = CreateCapability("Alexa.SceneController");
+			scene_capability["supportsDeactivation"] = false;
+
+			endpoint["capabilities"] = Json::Value(Json::arrayValue);
+			endpoint["capabilities"].append(scene_capability);
+		}
+		else // Group
+		{
+			// Add PowerController capability
+			Json::Value power_capability = CreateCapabilityWithProperties("Alexa.PowerController", "powerState", false, true);
+
+			endpoint["capabilities"] = Json::Value(Json::arrayValue);
+			endpoint["capabilities"].append(power_capability);
+		}
+
+		// Add Alexa capability
+		endpoint["capabilities"].append(CreateCapability("Alexa"));
+
+		// Add cookie with metadata
+		endpoint["cookie"]["WhatAmI"] = "scene";
+		endpoint["cookie"]["SceneType"] = scene_type;
+
+		root["event"]["payload"]["endpoints"].append(endpoint);
+	}
 }
 
 void CWebServer::Alexa_HandleAcceptGrant(WebEmSession& session, const request& req, Json::Value& root)
@@ -45,9 +188,7 @@ void CWebServer::Alexa_HandleAcceptGrant(WebEmSession& session, const request& r
 	if (!reader.parse(req.content, request_json))
 	{
 		root["event"]["header"]["namespace"] = "Alexa";
-		root["event"]["header"]["name"] = "ErrorResponse";
-		root["event"]["payload"]["type"] = "INVALID_DIRECTIVE";
-		root["event"]["payload"]["message"] = "Invalid JSON";
+		CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "Invalid JSON");
 		return;
 	}
 
@@ -108,14 +249,106 @@ void CWebServer::Alexa_HandleAcceptGrant(WebEmSession& session, const request& r
 	root["event"]["payload"] = Json::Value(Json::objectValue);
 }
 
-static void CreateErrorResponse(Json::Value& root, const Json::Value& request_json, const std::string& error_type, const std::string& error_message)
+static void Alexa_HandleControl_scene(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_namespace, const std::string& directive_name)
 {
-	root["event"]["header"]["namespace"] = "Alexa";
-	root["event"]["header"]["name"] = "ErrorResponse";
-	root["event"]["header"]["payloadVersion"] = "3";
-	root["event"]["header"]["messageId"] = request_json["directive"]["header"]["messageId"].asString();
-	root["event"]["payload"]["type"] = error_type;
-	root["event"]["payload"]["message"] = error_message;
+	// Check if scene is protected
+	std::vector<std::vector<std::string>> result;
+	result = m_sql.safe_query("SELECT Protected FROM Scenes WHERE (ID = %llu)", device_idx);
+	if (result.empty() || atoi(result[0][0].c_str()) != 0)
+	{
+		CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Scene not found or protected");
+		return;
+	}
+
+	// Check if this is a ReportState request
+	if (directive_namespace == "Alexa" && directive_name == "ReportState")
+	{
+		// Query the scene/group info
+		result = m_sql.safe_query("SELECT nValue, SceneType FROM Scenes WHERE (ID = %llu)", device_idx);
+		if (result.empty())
+		{
+			CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Scene/Group not found");
+			return;
+		}
+
+		// Only groups (not scenes) support state reporting
+		int scene_type = atoi(result[0][1].c_str());
+		if (scene_type == 0) // Scene
+		{
+			CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "ReportState not supported for scenes");
+			return;
+		}
+
+		int nValue = atoi(result[0][0].c_str());
+		std::string power_state = (nValue != 0) ? "ON" : "OFF";
+
+		// Return StateReport
+		root["event"]["header"]["name"] = "StateReport";
+
+		// Add powerState to context
+		root["context"]["properties"].append(CreateProperty("Alexa.PowerController", "powerState", power_state));
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	// Handle control directives
+	if (directive_namespace == "Alexa.SceneController")
+	{
+		// SceneController: Activate (for Scenes only)
+		if (directive_name == "Activate")
+		{
+			// Switch the scene
+			std::string idx_str = std::to_string(device_idx);
+			_log.Log(LOG_STATUS, "User: %s initiated a scene command via Alexa", session.username.c_str());
+			if (!m_mainworker.SwitchScene(idx_str, "On", session.username))
+			{
+				root["event"]["header"]["namespace"] = "Alexa";
+				CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Scene activation failed");
+				return;
+			}
+
+			// Return ActivationStarted response
+			root["event"]["header"]["namespace"] = "Alexa.SceneController";
+			root["event"]["header"]["name"] = "ActivationStarted";
+			root["event"]["payload"]["cause"]["type"] = "VOICE_INTERACTION";
+			root["event"]["payload"]["timestamp"] = GetISO8601Timestamp();
+			return;
+		}
+		else
+		{
+			CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "SceneController only supports Activate");
+			return;
+		}
+	}
+	else if (directive_namespace == "Alexa.PowerController")
+	{
+		// PowerController: TurnOn/TurnOff (for Groups)
+		if (directive_name == "TurnOn" || directive_name == "TurnOff")
+		{
+			// Switch the group
+			std::string idx_str = std::to_string(device_idx);
+			std::string switchcmd = (directive_name == "TurnOn") ? "On" : "Off";
+			_log.Log(LOG_STATUS, "User: %s initiated a group command via Alexa", session.username.c_str());
+			if (!m_mainworker.SwitchScene(idx_str, switchcmd, session.username))
+			{
+				CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Group switch failed");
+				return;
+			}
+
+			// Add powerState to context
+			root["context"]["properties"].append(CreateProperty("Alexa.PowerController", "powerState", (directive_name == "TurnOn") ? "ON" : "OFF"));
+			root["context"]["properties"].append(CreateEndpointHealthProperty());
+			return;
+		}
+		else
+		{
+			CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "PowerController only supports TurnOn/TurnOff");
+			return;
+		}
+	}
+
+	// Unsupported directive for scenes
+	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "Unsupported directive for scene/group");
 }
 
 static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx)
@@ -168,9 +401,7 @@ void CWebServer::Alexa_HandleControl(WebEmSession& session, const request& req, 
 	if (!reader.parse(req.content, request_json))
 	{
 		root["event"]["header"]["namespace"] = "Alexa";
-		root["event"]["header"]["name"] = "ErrorResponse";
-		root["event"]["payload"]["type"] = "INVALID_DIRECTIVE";
-		root["event"]["payload"]["message"] = "Invalid JSON";
+		CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "Invalid JSON");
 		return;
 	}
 
@@ -179,69 +410,77 @@ void CWebServer::Alexa_HandleControl(WebEmSession& session, const request& req, 
 	std::string endpoint_id = request_json["directive"]["endpoint"]["endpointId"].asString();
 	Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
 
-	// Parse endpoint ID to determine device type and index
-	bool is_scene = false;
-	std::string device_idx_str = endpoint_id;
+	// Build base response structure (can be modified by handlers)
+	root["event"]["header"]["namespace"] = "Alexa";
+	root["event"]["header"]["name"] = "Response";
+	root["event"]["header"]["payloadVersion"] = "3";
+	root["event"]["header"]["messageId"] = request_json["directive"]["header"]["messageId"].asString();
+	root["event"]["endpoint"]["endpointId"] = endpoint_id;
+	root["event"]["payload"] = Json::Value(Json::objectValue);
+	root["context"]["properties"] = Json::Value(Json::arrayValue);
 
-	// Check for scene_ prefix
-	if (endpoint_id.find("scene_") == 0)
+	// Parse endpoint ID into prefix and index
+	std::string prefix;
+	std::string device_idx_str;
+	size_t underscore_pos = endpoint_id.rfind('_');
+	if (underscore_pos != std::string::npos)
 	{
-		is_scene = true;
-		device_idx_str = endpoint_id.substr(6); // Remove "scene_" prefix
+		prefix = endpoint_id.substr(0, underscore_pos + 1);
+		device_idx_str = endpoint_id.substr(underscore_pos + 1);
 	}
 	else
 	{
-		// Remove any other xxx_ prefix (e.g., selector_)
-		size_t underscore_pos = endpoint_id.find('_');
-		if (underscore_pos != std::string::npos)
-		{
-			device_idx_str = endpoint_id.substr(underscore_pos + 1);
-		}
+		device_idx_str = endpoint_id;
 	}
 
 	uint64_t device_idx = std::stoull(device_idx_str);
 
-	// Check access control for devices (scenes don't have per-user access control)
-	if (!is_scene)
+	// Handle scenes/groups
+	if (prefix == "scene_")
 	{
-		bool bControlPermitted;
-		if (!CheckDeviceAccess(this, session, device_idx, bControlPermitted))
-		{
-			CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device not found or access denied");
-			return;
-		}
-
-		// ReportState is allowed for read-only users
-		if (directive_namespace == "Alexa" && directive_name == "ReportState")
-		{
-			Alexa_HandleControl_ReportState(session, request_json, root, device_idx);
-			return;
-		}
-
-		// Control operations require write permission
-		if (!bControlPermitted)
-		{
-			CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device control not permitted");
-			return;
-		}
-	}
-
-	// Check if this is a ReportState request
-	if (directive_namespace == "Alexa" && directive_name == "ReportState")
-	{
-		// TODO: Query device state and return StateReport
-		CreateErrorResponse(root, request_json, "INTERNAL_ERROR", "ReportState not yet implemented");
+		Alexa_HandleControl_scene(session, request_json, root, device_idx, directive_namespace, directive_name);
 		return;
 	}
 
-	// Handle control directives (PowerController, BrightnessController, etc.)
-	// TODO: Implement control handlers
-	root["event"]["header"]["namespace"] = "Alexa";
-	root["event"]["header"]["name"] = "ErrorResponse";
-	root["event"]["header"]["payloadVersion"] = "3";
-	root["event"]["header"]["messageId"] = request_json["directive"]["header"]["messageId"].asString();
-	root["event"]["payload"]["type"] = "INTERNAL_ERROR";
-	root["event"]["payload"]["message"] = "Control not yet implemented: " + directive_namespace + "/" + directive_name;
+	// Check access control for devices
+	bool bControlPermitted;
+	if (!CheckDeviceAccess(this, session, device_idx, bControlPermitted))
+	{
+		CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device not found or access denied");
+		return;
+	}
+
+	// ReportState is allowed for read-only users
+	if (directive_namespace == "Alexa" && directive_name == "ReportState")
+	{
+		Alexa_HandleControl_ReportState(session, request_json, root, device_idx);
+		return;
+	}
+
+	// Control operations require write permission
+	if (!bControlPermitted)
+	{
+		CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device control not permitted");
+		return;
+	}
+
+	// Dispatch to controller-specific handlers
+	typedef void (*ControllerHandler)(WebEmSession&, const Json::Value&, Json::Value&, uint64_t, const std::string&);
+
+	static const std::map<std::string, ControllerHandler> controller_handlers = {
+	};
+
+	// Look up handler in dispatch map
+	auto it = controller_handlers.find(directive_namespace);
+	if (it != controller_handlers.end())
+	{
+		it->second(session, request_json, root, device_idx, directive_name);
+		return;
+	}
+
+	// TODO: Implement other control handlers
+	_log.Log(LOG_ERROR, "Alexa: Unimplemented control: %s/%s", directive_namespace.c_str(), directive_name.c_str());
+	CreateErrorResponse(root, request_json, "INTERNAL_ERROR", "Control not yet implemented: " + directive_namespace + "/" + directive_name);
 }
 
 void CWebServer::GetAlexaPage(WebEmSession& session, const request& req, reply& rep)
