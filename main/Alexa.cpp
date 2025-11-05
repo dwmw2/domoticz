@@ -27,12 +27,14 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 		return;
 	}
 
-	root["event"]["header"]["namespace"] = "Alexa";
-	root["event"]["header"]["name"] = "ErrorResponse";
+	// Build discovery response structure
+	root["event"]["header"]["namespace"] = "Alexa.Discovery";
+	root["event"]["header"]["name"] = "Discover.Response";
 	root["event"]["header"]["payloadVersion"] = "3";
 	root["event"]["header"]["messageId"] = request_json["directive"]["header"]["messageId"].asString();
-	root["event"]["payload"]["type"] = "INTERNAL_ERROR";
-	root["event"]["payload"]["message"] = "Discovery not yet implemented";
+	root["event"]["payload"]["endpoints"] = Json::Value(Json::arrayValue);
+
+	// TODO: Query devices and scenes directly from database
 }
 
 void CWebServer::Alexa_HandleAcceptGrant(WebEmSession& session, const request& req, Json::Value& root)
