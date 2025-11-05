@@ -345,6 +345,9 @@
     <Filter Include="Devices\AccuWeather">
       <UniqueIdentifier>{3a086069-f89a-44b7-b3a8-19cb9b7509eb}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Alexa">
+      <UniqueIdentifier>{4b8294bc-714f-458e-9a88-5e5b20672ea8}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Pushers">
       <UniqueIdentifier>{b669cde0-9cf1-43ae-a5c0-5f01851e9b45}</UniqueIdentifier>
     </Filter>
@@ -2892,6 +2895,9 @@
     </ClCompile>
     <ClCompile Include="..\hardware\DenkoviUSBDevices.cpp">
       <Filter>Devices\Denkovi</Filter>
+    </ClCompile>
+    <ClCompile Include="..\main\Alexa.cpp">
+      <Filter>Alexa</Filter>
     </ClCompile>
     <ClCompile Include="..\main\BaroForecastCalculator.cpp">
       <Filter>Helpers</Filter>
