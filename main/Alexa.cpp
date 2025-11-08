@@ -506,6 +506,53 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 				root["event"]["payload"]["endpoints"].append(endpoint);
 			}
 		}
+		// Handle temperature and environmental sensors
+		else if (device_type == pTypeTEMP || device_type == pTypeTEMP_HUM || device_type == pTypeHUM || 
+		         device_type == pTypeTEMP_HUM_BARO || device_type == pTypeTEMP_BARO)
+		{
+			std::string sensor_idx = device_idx;
+			std::string sensor_name = device_name;
+			int sensor_type = device_type;
+
+		// Determine description and category based on sensor type
+		std::string description, category;
+		if (sensor_type == pTypeHUM)
+		{
+			description = "Humidity Sensor";
+			category = "OTHER";
+		}
+		else
+		{
+			description = "Temperature Sensor";
+			category = "TEMPERATURE_SENSOR";
+		}
+
+		Json::Value endpoint = CreateEndpoint("sensor_" + sensor_idx, sensor_name, description, category);
+
+		endpoint["capabilities"] = Json::Value(Json::arrayValue);
+
+		// Add TemperatureSensor for Temp and Temp+Hum devices
+		if (sensor_type == pTypeTEMP || sensor_type == pTypeTEMP_HUM || sensor_type == pTypeTEMP_HUM_BARO || sensor_type == pTypeTEMP_BARO)
+		{
+			endpoint["capabilities"].append(CreateCapabilityWithProperties("Alexa.TemperatureSensor", "temperature", false, true));
+		}
+
+		// Add HumiditySensor for Temp+Hum and humidity-only sensors
+		if (sensor_type == pTypeTEMP_HUM || sensor_type == pTypeTEMP_HUM_BARO || sensor_type == pTypeHUM)
+		{
+			endpoint["capabilities"].append(CreateCapabilityWithProperties("Alexa.HumiditySensor", "relativeHumidity", false, true));
+		}
+
+		endpoint["capabilities"].append(CreateCapability("Alexa.EndpointHealth"));
+		endpoint["capabilities"].append(CreateCapability("Alexa"));
+
+		// Add cookie with metadata
+		endpoint["cookie"]["WhatAmI"] = "sensor";
+		endpoint["cookie"]["sensorType"] = sensor_type;
+		endpoint["cookie"]["deviceName"] = sensor_name;
+
+		root["event"]["payload"]["endpoints"].append(endpoint);
+		}
 	}
 
 	// Get scenes/groups that are in room plans and not protected
@@ -1266,6 +1313,48 @@ static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::V
 			root["context"]["properties"].append(CreateEndpointHealthProperty());
 			return;
 		}
+	}
+
+	// Handle temperature and environmental sensors
+	if (dType == pTypeTEMP || dType == pTypeTEMP_HUM || dType == pTypeHUM || dType == pTypeTEMP_HUM_BARO || dType == pTypeTEMP_BARO)
+	{
+		root["event"]["header"]["name"] = "StateReport";
+
+		// Parse temperature/humidity from sValue (already queried above)
+		std::string sValue = result[0][4];
+		std::vector<std::string> values;
+		StringSplit(sValue, ";", values);
+
+		if (dType == pTypeTEMP || dType == pTypeTEMP_HUM || dType == pTypeTEMP_HUM_BARO || dType == pTypeTEMP_BARO)
+		{
+			if (!values.empty())
+			{
+				double temp = atof(values[0].c_str());
+				Json::Value temp_value;
+				temp_value["value"] = temp;
+				temp_value["scale"] = "CELSIUS";
+				root["context"]["properties"].append(CreateProperty("Alexa.TemperatureSensor", "temperature", temp_value));
+			}
+		}
+
+		if (dType == pTypeTEMP_HUM || dType == pTypeTEMP_HUM_BARO)
+		{
+			if (values.size() > 1)
+			{
+				int humidity = atoi(values[1].c_str());
+				root["context"]["properties"].append(CreateProperty("Alexa.HumiditySensor", "relativeHumidity", humidity));
+			}
+		}
+
+		if (dType == pTypeHUM)
+		{
+			// For humidity-only sensors, humidity is stored in nValue
+			unsigned char nValue = atoi(result[0][3].c_str());
+			root["context"]["properties"].append(CreateProperty("Alexa.HumiditySensor", "relativeHumidity", (int)nValue));
+		}
+
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
 	}
 
 	// Unsupported device type for ReportState
