@@ -395,8 +395,35 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 				endpoint["cookie"]["switchtype"] = switch_type;
 				endpoint["cookie"]["deviceName"] = device_name;
 
-			root["event"]["payload"]["endpoints"].append(endpoint);
-		}
+				root["event"]["payload"]["endpoints"].append(endpoint);
+			}
+			// Handle simple On/Off and Dimmer switches
+			else if (switch_type == STYPE_OnOff || switch_type == STYPE_Dimmer)
+			{
+				Json::Value endpoint = CreateEndpoint("switch_" + device_idx, device_name, 
+					(switch_type == STYPE_Dimmer) ? "Dimmable Light" : "Switch", "SWITCH");
+
+				// Add PowerController capability
+				Json::Value power_capability = CreateCapabilityWithProperties("Alexa.PowerController", "powerState", false, true);
+				endpoint["capabilities"] = Json::Value(Json::arrayValue);
+				endpoint["capabilities"].append(power_capability);
+
+				// Add BrightnessController for dimmers
+				if (switch_type == STYPE_Dimmer)
+				{
+					Json::Value brightness_capability = CreateCapabilityWithProperties("Alexa.BrightnessController", "brightness", false, true);
+					endpoint["capabilities"].append(brightness_capability);
+				}
+
+				endpoint["capabilities"].append(CreateCapability("Alexa"));
+
+				// Add cookie with metadata
+				endpoint["cookie"]["WhatAmI"] = "switch";
+				endpoint["cookie"]["switchtype"] = switch_type;
+				endpoint["cookie"]["deviceName"] = device_name;
+
+				root["event"]["payload"]["endpoints"].append(endpoint);
+			}
 		}
 	}
 
@@ -682,39 +709,126 @@ static void Alexa_HandleControl_PowerController(WebEmSession& session, const Jso
 {
 	if (directive_name == "TurnOn" || directive_name == "TurnOff")
 	{
-		// PowerController for blinds - stop command
-		_log.Log(LOG_STATUS, "User: %s stopped blind %llu via Alexa", session.username.c_str(), device_idx);
+		Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
+		std::string whatAmI = cookie.get("WhatAmI", "").asString();
 
-		if (m_mainworker.SwitchLight(device_idx, "Stop", 0, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
+		if (whatAmI == "blind")
+		{
+			// PowerController for blinds - stop command
+			_log.Log(LOG_STATUS, "User: %s stopped blind %llu via Alexa", session.username.c_str(), device_idx);
+
+			if (m_mainworker.SwitchLight(device_idx, "Stop", 0, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
+			{
+				CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
+				return;
+			}
+
+			std::vector<std::vector<std::string>> result;
+			result = m_sql.safe_query("SELECT Type, SubType, SwitchType, nValue, sValue FROM DeviceStatus WHERE (ID = %llu)", device_idx);
+			if (!result.empty())
+			{
+				unsigned char dType = atoi(result[0][0].c_str());
+				unsigned char dSubType = atoi(result[0][1].c_str());
+				_eSwitchType switchtype = (_eSwitchType)atoi(result[0][2].c_str());
+				unsigned char nValue = atoi(result[0][3].c_str());
+				std::string sValue = result[0][4];
+
+				std::string lstatus;
+				int level;
+				bool bHaveDimmer, bHaveGroupCmd;
+				int maxDimLevel;
+				GetLightStatus(dType, dSubType, switchtype, nValue, sValue, lstatus, level, bHaveDimmer, maxDimLevel, bHaveGroupCmd);
+
+				root["context"]["properties"].append(CreateProperty("Alexa.RangeController", "rangeValue", level, "Blind.Lift"));
+			}
+			root["context"]["properties"].append(CreateEndpointHealthProperty());
+			return;
+		}
+		else if (whatAmI == "switch")
+		{
+			// PowerController for simple switches
+			std::string switchcmd = (directive_name == "TurnOn") ? "On" : "Off";
+			_log.Log(LOG_STATUS, "User: %s set switch %llu to %s via Alexa", session.username.c_str(), device_idx, switchcmd.c_str());
+
+			if (m_mainworker.SwitchLight(device_idx, switchcmd, 0, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
+			{
+				CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
+				return;
+			}
+
+			root["context"]["properties"].append(CreateProperty("Alexa.PowerController", "powerState", (directive_name == "TurnOn") ? "ON" : "OFF"));
+			root["context"]["properties"].append(CreateEndpointHealthProperty());
+			return;
+		}
+	}
+
+	// Unsupported directive for PowerController
+	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "PowerController only supports TurnOn/TurnOff");
+}
+
+static void Alexa_HandleControl_BrightnessController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
+{
+	if (directive_name == "SetBrightness")
+	{
+		int brightness = request_json["directive"]["payload"]["brightness"].asInt();
+		_log.Log(LOG_STATUS, "User: %s set dimmer %llu to %d%% via Alexa", session.username.c_str(), device_idx, brightness);
+
+		if (m_mainworker.SwitchLight(device_idx, "Set Level", brightness, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
 		{
 			CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
 			return;
 		}
 
+		root["context"]["properties"].append(CreateProperty("Alexa.BrightnessController", "brightness", brightness));
+		root["context"]["properties"].append(CreateProperty("Alexa.PowerController", "powerState", (brightness > 0) ? "ON" : "OFF"));
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+	else if (directive_name == "AdjustBrightness")
+	{
+		int brightnessDelta = request_json["directive"]["payload"]["brightnessDelta"].asInt();
+
+		// Query current brightness
 		std::vector<std::vector<std::string>> result;
 		result = m_sql.safe_query("SELECT Type, SubType, SwitchType, nValue, sValue FROM DeviceStatus WHERE (ID = %llu)", device_idx);
-		if (!result.empty())
+		if (result.empty())
 		{
-			unsigned char dType = atoi(result[0][0].c_str());
-			unsigned char dSubType = atoi(result[0][1].c_str());
-			_eSwitchType switchtype = (_eSwitchType)atoi(result[0][2].c_str());
-			unsigned char nValue = atoi(result[0][3].c_str());
-			std::string sValue = result[0][4];
-
-			std::string lstatus;
-			int level;
-			bool bHaveDimmer, bHaveGroupCmd;
-			int maxDimLevel;
-			GetLightStatus(dType, dSubType, switchtype, nValue, sValue, lstatus, level, bHaveDimmer, maxDimLevel, bHaveGroupCmd);
-
-			root["context"]["properties"].append(CreateProperty("Alexa.RangeController", "rangeValue", level, "Blind.Lift"));
+			CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device not found");
+			return;
 		}
+
+		unsigned char dType = atoi(result[0][0].c_str());
+		unsigned char dSubType = atoi(result[0][1].c_str());
+		_eSwitchType switchtype = (_eSwitchType)atoi(result[0][2].c_str());
+		unsigned char nValue = atoi(result[0][3].c_str());
+		std::string sValue = result[0][4];
+
+		std::string lstatus;
+		int level;
+		bool bHaveDimmer, bHaveGroupCmd;
+		int maxDimLevel;
+		GetLightStatus(dType, dSubType, switchtype, nValue, sValue, lstatus, level, bHaveDimmer, maxDimLevel, bHaveGroupCmd);
+
+		int new_brightness = level + brightnessDelta;
+		if (new_brightness < 0) new_brightness = 0;
+		if (new_brightness > 100) new_brightness = 100;
+
+		_log.Log(LOG_STATUS, "User: %s adjusted dimmer %llu by %d%% to %d%% via Alexa", session.username.c_str(), device_idx, brightnessDelta, new_brightness);
+
+		if (m_mainworker.SwitchLight(device_idx, "Set Level", new_brightness, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
+		{
+			CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
+			return;
+		}
+
+		root["context"]["properties"].append(CreateProperty("Alexa.BrightnessController", "brightness", new_brightness));
+		root["context"]["properties"].append(CreateProperty("Alexa.PowerController", "powerState", (new_brightness > 0) ? "ON" : "OFF"));
 		root["context"]["properties"].append(CreateEndpointHealthProperty());
 		return;
 	}
 
-	// Unsupported directive for PowerController
-	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "PowerController only supports TurnOn/TurnOff");
+	// Unsupported directive for BrightnessController
+	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "BrightnessController only supports SetBrightness/AdjustBrightness");
 }
 
 static void Alexa_HandleControl_ModeController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
@@ -806,6 +920,21 @@ static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::V
 			 switchtype == STYPE_BlindsPercentageWithStop || switchtype == STYPE_BlindsWithStop)
 		{
 			root["context"]["properties"].append(CreateProperty("Alexa.RangeController", "rangeValue", level, "Blind.Lift"));
+			root["context"]["properties"].append(CreateEndpointHealthProperty());
+			return;
+		}
+		else if (switchtype == STYPE_OnOff || switchtype == STYPE_Dimmer)
+		{
+			// Simple On/Off or Dimmer switch
+			std::string power_state = (lstatus == "Off") ? "OFF" : "ON";
+			root["context"]["properties"].append(CreateProperty("Alexa.PowerController", "powerState", power_state));
+
+			// Add brightness for dimmers
+			if (switchtype == STYPE_Dimmer)
+			{
+				root["context"]["properties"].append(CreateProperty("Alexa.BrightnessController", "brightness", level));
+			}
+
 			root["context"]["properties"].append(CreateEndpointHealthProperty());
 			return;
 		}
@@ -928,6 +1057,7 @@ void CWebServer::Alexa_HandleControl(WebEmSession& session, const request& req, 
 	static const std::map<std::string, ControllerHandler> controller_handlers = {
 		{"Alexa.RangeController", Alexa_HandleControl_RangeController},
 		{"Alexa.PowerController", Alexa_HandleControl_PowerController},
+		{"Alexa.BrightnessController", Alexa_HandleControl_BrightnessController},
 		{"Alexa.ModeController", Alexa_HandleControl_ModeController}
 	};
 
