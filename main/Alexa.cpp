@@ -133,7 +133,44 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 	root["event"]["header"]["messageId"] = request_json["directive"]["header"]["messageId"].asString();
 	root["event"]["payload"]["endpoints"] = Json::Value(Json::arrayValue);
 
-	// TODO: Add device enumeration
+	// Get user ID for access control
+	int iUser = FindUser(session.username.c_str());
+	if (iUser == -1)
+	{
+		_log.Log(LOG_ERROR, "Alexa Discovery: User '%s' not found", session.username.c_str());
+		return;
+	}
+
+	// Get devices - all devices for admin, shared devices for regular users
+	std::vector<std::vector<std::string>> devices_result;
+	if (m_users[iUser].userrights == URIGHTS_ADMIN)
+	{
+		devices_result = m_sql.safe_query(
+			"SELECT DISTINCT d.ID, d.Name, d.Type, d.SubType, d.SwitchType, d.Options "
+			"FROM DeviceStatus d "
+			"INNER JOIN DeviceToPlansMap p ON d.ID = p.DeviceRowID AND p.DevSceneType = 0 "
+			"WHERE d.Used = 1 "
+			"AND d.ID NOT IN (SELECT DeviceRowID FROM DeviceToPlansMap WHERE PlanID IN (SELECT ID FROM Plans WHERE Name = '$Hidden Devices') AND DevSceneType = 0) "
+			"ORDER BY d.ID");
+	}
+	else
+	{
+		unsigned long userID = m_users[iUser].ID;
+		devices_result = m_sql.safe_query(
+			"SELECT DISTINCT d.ID, d.Name, d.Type, d.SubType, d.SwitchType, d.Options "
+			"FROM DeviceStatus d "
+			"INNER JOIN SharedDevices s ON d.ID = s.DeviceRowID "
+			"INNER JOIN DeviceToPlansMap p ON d.ID = p.DeviceRowID AND p.DevSceneType = 0 "
+			"WHERE s.SharedUserID = %lu AND d.Used = 1 "
+			"AND d.ID NOT IN (SELECT DeviceRowID FROM DeviceToPlansMap WHERE PlanID IN (SELECT ID FROM Plans WHERE Name = '$Hidden Devices') AND DevSceneType = 0) "
+			"ORDER BY d.ID",
+			userID);
+	}
+
+	for (const auto& device_row : devices_result)
+	{
+		// TODO: Convert device to Alexa endpoint
+	}
 
 	// Get scenes/groups that are in room plans and not protected
 	std::vector<std::vector<std::string>> scenes_result;
@@ -353,8 +390,36 @@ static void Alexa_HandleControl_scene(WebEmSession& session, const Json::Value& 
 
 static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx)
 {
-	// TODO: Query device state and return StateReport
-	CreateErrorResponse(root, request_json, "INTERNAL_ERROR", "ReportState not yet implemented");
+	Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
+	std::string endpoint_id = request_json["directive"]["endpoint"]["endpointId"].asString();
+
+	// Query device state
+	std::vector<std::vector<std::string>> result;
+	result = m_sql.safe_query("SELECT Type, SubType, SwitchType, nValue, sValue FROM DeviceStatus WHERE (ID = %llu)", device_idx);
+	if (result.empty())
+	{
+		CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device not found");
+		return;
+	}
+
+	unsigned char dType = atoi(result[0][0].c_str());
+	unsigned char dSubType = atoi(result[0][1].c_str());
+	_eSwitchType switchtype = (_eSwitchType)atoi(result[0][2].c_str());
+
+	// Begin creating a StateReport
+	root["event"]["header"]["name"] = "StateReport";
+
+	// First, switches...
+	if (IsLightOrSwitch(dType, dSubType)
+	    || ((dType == pTypeRego6XXValue) && (dSubType == sTypeRego6XXStatus)))
+	{
+		unsigned char nValue = atoi(result[0][3].c_str());
+		std::string sValue = result[0][4];
+
+	}
+
+	// Unsupported device type for ReportState
+	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "ReportState not supported for this device type");
 }
 
 static bool CheckDeviceAccess(CWebServer* server, const WebEmSession& session, uint64_t device_idx, bool& bControlPermitted)
