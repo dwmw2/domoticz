@@ -99,6 +99,19 @@ static void CreateErrorResponse(Json::Value& root, const Json::Value& request_js
 	root["event"]["payload"]["message"] = error_message;
 }
 
+// Build Alexa instance name from device name in cookie (e.g., "DeviceName.Mode")
+static std::string BuildInstanceName(const Json::Value& cookie, const std::string& endpoint_id, const std::string& suffix)
+{
+	if (cookie.isMember("deviceName"))
+	{
+		std::string device_name = cookie["deviceName"].asString();
+		device_name.erase(std::remove_if(device_name.begin(), device_name.end(),
+			[](char c) { return !isalnum(c); }), device_name.end());
+		return device_name + suffix;
+	}
+	return endpoint_id + suffix;
+}
+
 static Json::Value CreateFriendlyNames(const std::string& text)
 {
 	Json::Value names = Json::Value(Json::arrayValue);
@@ -169,7 +182,84 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 
 	for (const auto& device_row : devices_result)
 	{
-		// TODO: Convert device to Alexa endpoint
+		std::string device_idx = device_row[0];
+		std::string device_name = device_row[1];
+		int device_type = atoi(device_row[2].c_str());
+		int device_subtype = atoi(device_row[3].c_str());
+		int switch_type = atoi(device_row[4].c_str());
+		std::string options_str = device_row[5];
+
+		// Parse options using BuildDeviceOptions (handles base64 decoding)
+		std::map<std::string, std::string> options = m_sql.BuildDeviceOptions(options_str);
+
+		if (IsLightOrSwitch(device_type, device_subtype)
+		    || ((device_type == pTypeRego6XXValue) && (device_subtype == sTypeRego6XXStatus)))
+		{
+			// Handle selector switches
+			if (switch_type == STYPE_Selector)
+			{
+				Json::Value endpoint = CreateEndpoint("selector_" + device_idx, device_name, "Selector Switch", "OTHER");
+
+				// Create instance name from device name (remove spaces)
+				std::string instance_name = device_name;
+				instance_name.erase(std::remove(instance_name.begin(), instance_name.end(), ' '), instance_name.end());
+				instance_name += ".Mode";
+
+				// Add ModeController capability
+				Json::Value mode_capability = CreateCapabilityWithProperties("Alexa.ModeController", "mode", false, true);
+				mode_capability["instance"] = instance_name;
+
+				// Add capability resources (friendly names for the capability itself)
+				mode_capability["capabilityResources"]["friendlyNames"] = CreateFriendlyNames(device_name);
+
+				// Parse LevelNames from options
+				std::map<std::string, std::string> selector_statuses;
+				GetSelectorSwitchStatuses(options, selector_statuses);
+
+				if (selector_statuses.empty())
+				{
+					_log.Log(LOG_ERROR, "(Alexa) Selector switch '%s' (idx %s) has no level names configured", device_name.c_str(), device_idx.c_str());
+					continue;
+				}
+
+				// Check if Off level should be hidden
+				bool hide_off_level = false;
+				auto it_hide = options.find("LevelOffHidden");
+				if (it_hide != options.end() && it_hide->second == "true")
+				{
+					hide_off_level = true;
+				}
+
+				mode_capability["configuration"]["ordered"] = false;
+				mode_capability["configuration"]["supportedModes"] = Json::Value(Json::arrayValue);
+
+				for (const auto& status : selector_statuses)
+				{
+					int level_value = atoi(status.first.c_str());
+
+					// Skip level 0 if LevelOffHidden is true
+					if (level_value == 0 && hide_off_level)
+					{
+						continue;
+					}
+
+					Json::Value mode;
+					mode["value"] = "Level." + std::to_string(level_value);
+					mode["modeResources"]["friendlyNames"] = CreateFriendlyNames(status.second);
+					mode_capability["configuration"]["supportedModes"].append(mode);
+				}
+				endpoint["capabilities"] = Json::Value(Json::arrayValue);
+				endpoint["capabilities"].append(mode_capability);
+				endpoint["capabilities"].append(CreateCapability("Alexa"));
+
+				// Add cookie with metadata
+				endpoint["cookie"]["WhatAmI"] = "selector";
+				endpoint["cookie"]["switchtype"] = switch_type;
+				endpoint["cookie"]["deviceName"] = device_name;
+
+				root["event"]["payload"]["endpoints"].append(endpoint);
+			}
+		}
 	}
 
 	// Get scenes/groups that are in room plans and not protected
@@ -388,6 +478,47 @@ static void Alexa_HandleControl_scene(WebEmSession& session, const Json::Value& 
 	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "Unsupported directive for scene/group");
 }
 
+static void Alexa_HandleControl_ModeController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
+{
+	if (directive_name == "SetMode")
+	{
+		Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
+		std::string endpoint_id = request_json["directive"]["endpoint"]["endpointId"].asString();
+		std::string mode_value = request_json["directive"]["payload"]["mode"].asString();
+
+		// Parse level from "Level.X" format
+		int level = 0;
+		if (mode_value.find("Level.") == 0)
+		{
+			level = atoi(mode_value.substr(6).c_str());
+		}
+		else
+		{
+			level = atoi(mode_value.c_str());
+		}
+
+		// Switch the selector to the specified level
+		_log.Log(LOG_STATUS, "User: %s set selector switch %llu to level %d via Alexa", session.username.c_str(), device_idx, level);
+
+		if (m_mainworker.SwitchLight(device_idx, "Set Level", level, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
+		{
+			CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
+			return;
+		}
+
+		// Build instance name from device name in cookie
+		std::string instance_name = BuildInstanceName(cookie, endpoint_id, ".Mode");
+
+		// Add mode to context
+		root["context"]["properties"].append(CreateProperty("Alexa.ModeController", "mode", mode_value, instance_name));
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	// Unsupported directive for ModeController
+	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "ModeController only supports SetMode");
+}
+
 static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx)
 {
 	Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
@@ -416,6 +547,22 @@ static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::V
 		unsigned char nValue = atoi(result[0][3].c_str());
 		std::string sValue = result[0][4];
 
+		std::string lstatus;
+		int level;
+		bool bHaveDimmer, bHaveGroupCmd;
+		int maxDimLevel;
+		GetLightStatus(dType, dSubType, switchtype, nValue, sValue, lstatus, level, bHaveDimmer, maxDimLevel, bHaveGroupCmd);
+
+		if (switchtype == STYPE_Selector)
+		{
+			// Build instance name from device name in cookie
+			std::string instance_name = BuildInstanceName(cookie, endpoint_id, ".Mode");
+
+			// Add mode to context with Level.X format
+			root["context"]["properties"].append(CreateProperty("Alexa.ModeController", "mode", "Level." + std::to_string(level), instance_name));
+			root["context"]["properties"].append(CreateEndpointHealthProperty());
+			return;
+		}
 	}
 
 	// Unsupported device type for ReportState
@@ -533,6 +680,7 @@ void CWebServer::Alexa_HandleControl(WebEmSession& session, const request& req, 
 	typedef void (*ControllerHandler)(WebEmSession&, const Json::Value&, Json::Value&, uint64_t, const std::string&);
 
 	static const std::map<std::string, ControllerHandler> controller_handlers = {
+		{"Alexa.ModeController", Alexa_HandleControl_ModeController}
 	};
 
 	// Look up handler in dispatch map
