@@ -52,6 +52,38 @@ static Json::Value CreateEndpoint(const std::string& endpoint_id, const std::str
 	return endpoint;
 }
 
+static Json::Value CreateActionMapping(const std::string& action, const std::string& directive_name, const Json::Value& payload)
+{
+	Json::Value mapping;
+	mapping["@type"] = "ActionsToDirective";
+	mapping["actions"] = Json::Value(Json::arrayValue);
+	mapping["actions"].append(action);
+	mapping["directive"]["name"] = directive_name;
+	mapping["directive"]["payload"] = payload;
+	return mapping;
+}
+
+static Json::Value CreateStateMapping(const std::string& state, int value)
+{
+	Json::Value mapping;
+	mapping["@type"] = "StatesToValue";
+	mapping["states"] = Json::Value(Json::arrayValue);
+	mapping["states"].append(state);
+	mapping["value"] = value;
+	return mapping;
+}
+
+static Json::Value CreateStateRangeMapping(const std::string& state, int min_value, int max_value)
+{
+	Json::Value mapping;
+	mapping["@type"] = "StatesToRange";
+	mapping["states"] = Json::Value(Json::arrayValue);
+	mapping["states"].append(state);
+	mapping["range"]["minimumValue"] = min_value;
+	mapping["range"]["maximumValue"] = max_value;
+	return mapping;
+}
+
 static std::string GetISO8601Timestamp()
 {
 	time_t now = mytime(nullptr);
@@ -115,6 +147,31 @@ static std::string BuildInstanceName(const Json::Value& cookie, const std::strin
 static Json::Value CreateFriendlyNames(const std::string& text)
 {
 	Json::Value names = Json::Value(Json::arrayValue);
+	Json::Value name_us;
+	name_us["@type"] = "text";
+	name_us["value"]["locale"] = "en-US";
+	name_us["value"]["text"] = text;
+	names.append(name_us);
+	Json::Value name_gb;
+	name_gb["@type"] = "text";
+	name_gb["value"]["locale"] = "en-GB";
+	name_gb["value"]["text"] = text;
+	names.append(name_gb);
+	return names;
+}
+
+static Json::Value CreateAssetName(const std::string& assetId)
+{
+	Json::Value asset;
+	asset["@type"] = "asset";
+	asset["value"]["assetId"] = assetId;
+	return asset;
+}
+
+static Json::Value CreateFriendlyNamesWithAsset(const std::string& assetId, const std::string& text)
+{
+	Json::Value names = Json::Value(Json::arrayValue);
+	names.append(CreateAssetName(assetId));
 	Json::Value name_us;
 	name_us["@type"] = "text";
 	name_us["value"]["locale"] = "en-US";
@@ -259,6 +316,87 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 
 				root["event"]["payload"]["endpoints"].append(endpoint);
 			}
+			// Handle blinds
+			else if (switch_type == STYPE_Blinds || switch_type == STYPE_BlindsPercentage ||
+			         switch_type == STYPE_BlindsPercentageWithStop || switch_type == STYPE_BlindsWithStop)
+			{
+				Json::Value endpoint = CreateEndpoint("blind_" + device_idx, device_name, "Blind", "INTERIOR_BLIND");
+
+				bool has_percentage = (switch_type == STYPE_BlindsPercentage || switch_type == STYPE_BlindsPercentageWithStop);
+				bool has_stop = (switch_type == STYPE_BlindsPercentageWithStop || switch_type == STYPE_BlindsWithStop);
+
+				// Add RangeController capability for blind position
+				Json::Value range_capability = CreateCapabilityWithProperties("Alexa.RangeController", "rangeValue", false, has_percentage);
+				range_capability["instance"] = "Blind.Lift";
+
+				// Add capability resources using Alexa assets
+				range_capability["capabilityResources"]["friendlyNames"] = CreateFriendlyNamesWithAsset("Alexa.Setting.Opening", "Position");
+
+				// Configure range
+				range_capability["configuration"]["supportedRange"]["minimumValue"] = 0;
+				range_capability["configuration"]["supportedRange"]["maximumValue"] = 100;
+				range_capability["configuration"]["supportedRange"]["precision"] = 1;
+
+				// Add presets for Open and Closed
+				range_capability["configuration"]["presets"] = Json::Value(Json::arrayValue);
+
+				// Closed preset
+				Json::Value closed_preset;
+				closed_preset["rangeValue"] = 0;
+				closed_preset["presetResources"]["friendlyNames"] = CreateFriendlyNamesWithAsset("Alexa.Value.Close", "Closed");
+				range_capability["configuration"]["presets"].append(closed_preset);
+
+				// Open preset
+				Json::Value open_preset;
+				open_preset["rangeValue"] = 100;
+				open_preset["presetResources"]["friendlyNames"] = CreateFriendlyNamesWithAsset("Alexa.Value.Open", "Open");
+				range_capability["configuration"]["presets"].append(open_preset);
+
+				// Add semantics for actions
+				range_capability["semantics"]["actionMappings"] = Json::Value(Json::arrayValue);
+
+				Json::Value close_payload;
+				close_payload["rangeValue"] = 0;
+				range_capability["semantics"]["actionMappings"].append(CreateActionMapping("Alexa.Actions.Close", "SetRangeValue", close_payload));
+
+				Json::Value open_payload;
+				open_payload["rangeValue"] = 100;
+				range_capability["semantics"]["actionMappings"].append(CreateActionMapping("Alexa.Actions.Open", "SetRangeValue", open_payload));
+
+				Json::Value lower_payload;
+				lower_payload["rangeValueDelta"] = -10;
+				lower_payload["rangeValueDeltaDefault"] = false;
+				range_capability["semantics"]["actionMappings"].append(CreateActionMapping("Alexa.Actions.Lower", "AdjustRangeValue", lower_payload));
+
+				Json::Value raise_payload;
+				raise_payload["rangeValueDelta"] = 10;
+				raise_payload["rangeValueDeltaDefault"] = false;
+				range_capability["semantics"]["actionMappings"].append(CreateActionMapping("Alexa.Actions.Raise", "AdjustRangeValue", raise_payload));
+
+				// Add state mappings
+				range_capability["semantics"]["stateMappings"] = Json::Value(Json::arrayValue);
+				range_capability["semantics"]["stateMappings"].append(CreateStateMapping("Alexa.States.Closed", 0));
+				range_capability["semantics"]["stateMappings"].append(CreateStateRangeMapping("Alexa.States.Open", 1, 100));
+
+				endpoint["capabilities"] = Json::Value(Json::arrayValue);
+				endpoint["capabilities"].append(range_capability);
+
+				// Add PowerController if blind has stop button
+				if (has_stop)
+				{
+					Json::Value power_capability = CreateCapabilityWithProperties("Alexa.PowerController", "powerState", false, false);
+					endpoint["capabilities"].append(power_capability);
+				}
+
+				endpoint["capabilities"].append(CreateCapability("Alexa"));
+
+				// Add cookie with metadata
+				endpoint["cookie"]["WhatAmI"] = "blind";
+				endpoint["cookie"]["switchtype"] = switch_type;
+				endpoint["cookie"]["deviceName"] = device_name;
+
+			root["event"]["payload"]["endpoints"].append(endpoint);
+		}
 		}
 	}
 
@@ -478,6 +616,107 @@ static void Alexa_HandleControl_scene(WebEmSession& session, const Json::Value& 
 	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "Unsupported directive for scene/group");
 }
 
+static void Alexa_HandleControl_RangeController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
+{
+	if (directive_name == "SetRangeValue")
+	{
+		int rangeValue = request_json["directive"]["payload"]["rangeValue"].asInt();
+		_log.Log(LOG_STATUS, "User: %s set blind %llu to %d%% via Alexa", session.username.c_str(), device_idx, rangeValue);
+
+		if (m_mainworker.SwitchLight(device_idx, "Set Level", rangeValue, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
+		{
+			CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
+			return;
+		}
+
+		root["context"]["properties"].append(CreateProperty("Alexa.RangeController", "rangeValue", rangeValue, "Blind.Lift"));
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+	else if (directive_name == "AdjustRangeValue")
+	{
+		int rangeDelta = request_json["directive"]["payload"]["rangeValueDelta"].asInt();
+
+		std::vector<std::vector<std::string>> result;
+		result = m_sql.safe_query("SELECT Type, SubType, SwitchType, nValue, sValue FROM DeviceStatus WHERE (ID = %llu)", device_idx);
+		if (result.empty())
+		{
+			CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device not found");
+			return;
+		}
+
+		unsigned char dType = atoi(result[0][0].c_str());
+		unsigned char dSubType = atoi(result[0][1].c_str());
+		_eSwitchType switchtype = (_eSwitchType)atoi(result[0][2].c_str());
+		unsigned char nValue = atoi(result[0][3].c_str());
+		std::string sValue = result[0][4];
+
+		std::string lstatus;
+		int level;
+		bool bHaveDimmer, bHaveGroupCmd;
+		int maxDimLevel;
+		GetLightStatus(dType, dSubType, switchtype, nValue, sValue, lstatus, level, bHaveDimmer, maxDimLevel, bHaveGroupCmd);
+
+		int newLevel = level + rangeDelta;
+		if (newLevel < 0) newLevel = 0;
+		if (newLevel > 100) newLevel = 100;
+
+		_log.Log(LOG_STATUS, "User: %s adjusted blind %llu by %d to %d%% via Alexa", session.username.c_str(), device_idx, rangeDelta, newLevel);
+
+		if (m_mainworker.SwitchLight(device_idx, "Set Level", newLevel, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
+		{
+			CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
+			return;
+		}
+
+		root["context"]["properties"].append(CreateProperty("Alexa.RangeController", "rangeValue", newLevel, "Blind.Lift"));
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	// Unsupported directive for RangeController
+	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "RangeController only supports SetRangeValue/AdjustRangeValue");
+}
+
+static void Alexa_HandleControl_PowerController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
+{
+	if (directive_name == "TurnOn" || directive_name == "TurnOff")
+	{
+		// PowerController for blinds - stop command
+		_log.Log(LOG_STATUS, "User: %s stopped blind %llu via Alexa", session.username.c_str(), device_idx);
+
+		if (m_mainworker.SwitchLight(device_idx, "Stop", 0, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
+		{
+			CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
+			return;
+		}
+
+		std::vector<std::vector<std::string>> result;
+		result = m_sql.safe_query("SELECT Type, SubType, SwitchType, nValue, sValue FROM DeviceStatus WHERE (ID = %llu)", device_idx);
+		if (!result.empty())
+		{
+			unsigned char dType = atoi(result[0][0].c_str());
+			unsigned char dSubType = atoi(result[0][1].c_str());
+			_eSwitchType switchtype = (_eSwitchType)atoi(result[0][2].c_str());
+			unsigned char nValue = atoi(result[0][3].c_str());
+			std::string sValue = result[0][4];
+
+			std::string lstatus;
+			int level;
+			bool bHaveDimmer, bHaveGroupCmd;
+			int maxDimLevel;
+			GetLightStatus(dType, dSubType, switchtype, nValue, sValue, lstatus, level, bHaveDimmer, maxDimLevel, bHaveGroupCmd);
+
+			root["context"]["properties"].append(CreateProperty("Alexa.RangeController", "rangeValue", level, "Blind.Lift"));
+		}
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	// Unsupported directive for PowerController
+	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "PowerController only supports TurnOn/TurnOff");
+}
+
 static void Alexa_HandleControl_ModeController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
 {
 	if (directive_name == "SetMode")
@@ -560,6 +799,13 @@ static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::V
 
 			// Add mode to context with Level.X format
 			root["context"]["properties"].append(CreateProperty("Alexa.ModeController", "mode", "Level." + std::to_string(level), instance_name));
+			root["context"]["properties"].append(CreateEndpointHealthProperty());
+			return;
+		}
+		else if (switchtype == STYPE_Blinds || switchtype == STYPE_BlindsPercentage ||
+			 switchtype == STYPE_BlindsPercentageWithStop || switchtype == STYPE_BlindsWithStop)
+		{
+			root["context"]["properties"].append(CreateProperty("Alexa.RangeController", "rangeValue", level, "Blind.Lift"));
 			root["context"]["properties"].append(CreateEndpointHealthProperty());
 			return;
 		}
@@ -680,6 +926,8 @@ void CWebServer::Alexa_HandleControl(WebEmSession& session, const request& req, 
 	typedef void (*ControllerHandler)(WebEmSession&, const Json::Value&, Json::Value&, uint64_t, const std::string&);
 
 	static const std::map<std::string, ControllerHandler> controller_handlers = {
+		{"Alexa.RangeController", Alexa_HandleControl_RangeController},
+		{"Alexa.PowerController", Alexa_HandleControl_PowerController},
 		{"Alexa.ModeController", Alexa_HandleControl_ModeController}
 	};
 
