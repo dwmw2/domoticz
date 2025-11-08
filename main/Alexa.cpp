@@ -298,6 +298,96 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 			userID);
 	}
 
+	// First pass: identify thermostat component groupings
+	// Map from temperature device idx (or setpoint idx for standalone) to setpoint/mode/humidity device indices
+	std::map<std::string, std::map<std::string, std::string>> thermostat_components;
+	std::set<std::string> linked_devices; // Devices that are part of thermostats (don't expose separately)
+
+	for (const auto& device_row : devices_result)
+	{
+		std::string device_idx = device_row[0];
+		std::string device_name = device_row[1];
+		int device_type = atoi(device_row[2].c_str());
+
+		// Look for Setpoint devices
+		if (device_type == pTypeSetpoint)
+		{
+			bool found_temp = false;
+
+			// Find matching temperature sensor with same base name
+			for (const auto& temp_row : devices_result)
+			{
+				std::string temp_idx = temp_row[0];
+				std::string temp_name = temp_row[1];
+				int temp_type = atoi(temp_row[2].c_str());
+
+				if ((temp_type == pTypeTEMP || temp_type == pTypeTEMP_HUM || temp_type == pTypeTEMP_BARO) &&
+				    temp_name == device_name)
+				{
+					// Found matching temperature sensor
+					found_temp = true;
+					thermostat_components[temp_idx]["setpoint"] = device_idx;
+					linked_devices.insert(device_idx); // Hide setpoint device
+
+					// Look for Mode selector with " Mode" suffix
+					std::string mode_name = device_name + " Mode";
+					for (const auto& mode_row : devices_result)
+					{
+						std::string mode_idx = mode_row[0];
+						std::string mode_device_name = mode_row[1];
+						int mode_switch_type = atoi(mode_row[4].c_str());
+
+						if (mode_device_name == mode_name && mode_switch_type == STYPE_Selector)
+						{
+							thermostat_components[temp_idx]["mode"] = mode_idx;
+							linked_devices.insert(mode_idx); // Hide mode selector
+							break;
+						}
+					}
+
+					// Look for humidity sensor with same base name
+					for (const auto& hum_row : devices_result)
+					{
+						std::string hum_idx = hum_row[0];
+						std::string hum_name = hum_row[1];
+						int hum_type = atoi(hum_row[2].c_str());
+
+						if ((hum_type == pTypeHUM || hum_type == pTypeTEMP_HUM) &&
+						    hum_name == device_name && hum_idx != temp_idx)
+						{
+							thermostat_components[temp_idx]["humidity"] = hum_idx;
+							linked_devices.insert(hum_idx); // Hide humidity sensor
+							break;
+						}
+					}
+					break;
+				}
+			}
+
+			// If no temperature sensor found, create standalone setpoint thermostat
+			if (!found_temp)
+			{
+				thermostat_components[device_idx]["setpoint"] = device_idx;
+
+				// Look for Mode selector
+				std::string mode_name = device_name + " Mode";
+				for (const auto& mode_row : devices_result)
+				{
+					std::string mode_idx = mode_row[0];
+					std::string mode_device_name = mode_row[1];
+					int mode_switch_type = atoi(mode_row[4].c_str());
+
+					if (mode_device_name == mode_name && mode_switch_type == STYPE_Selector)
+					{
+						thermostat_components[device_idx]["mode"] = mode_idx;
+						linked_devices.insert(mode_idx); // Hide mode selector
+						break;
+					}
+				}
+			}
+		}
+	}
+
 	for (const auto& device_row : devices_result)
 	{
 		std::string device_idx = device_row[0];
@@ -306,6 +396,12 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 		int device_subtype = atoi(device_row[3].c_str());
 		int switch_type = atoi(device_row[4].c_str());
 		std::string options_str = device_row[5];
+
+		// Skip devices that are part of thermostat groupings
+		if (linked_devices.find(device_idx) != linked_devices.end())
+		{
+			continue;
+		}
 
 		// Parse options using BuildDeviceOptions (handles base64 decoding)
 		std::map<std::string, std::string> options = m_sql.BuildDeviceOptions(options_str);
@@ -506,52 +602,138 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 				root["event"]["payload"]["endpoints"].append(endpoint);
 			}
 		}
-		// Handle temperature and environmental sensors
-		else if (device_type == pTypeTEMP || device_type == pTypeTEMP_HUM || device_type == pTypeHUM || 
+		// Handle standalone setpoint devices (thermostats without temperature sensor)
+		else if (device_type == pTypeSetpoint)
+		{
+			// Check if this is a standalone thermostat
+			bool is_thermostat = (thermostat_components.find(device_idx) != thermostat_components.end());
+			if (!is_thermostat)
+			{
+				continue; // Skip if not in thermostat_components (shouldn't happen)
+			}
+
+			Json::Value endpoint = CreateEndpoint("setpoint_" + device_idx, device_name, "Thermostat", "THERMOSTAT");
+			endpoint["capabilities"] = Json::Value(Json::arrayValue);
+
+			// Add ThermostatController
+			Json::Value thermo_capability = CreateCapabilityWithProperties("Alexa.ThermostatController", "targetSetpoint", false, true);
+
+			// Add thermostatMode to supported properties
+			thermo_capability["properties"]["supported"].append(Json::Value());
+			thermo_capability["properties"]["supported"][1]["name"] = "thermostatMode";
+
+			// Add configuration for supported modes
+			thermo_capability["configuration"]["supportsScheduling"] = false;
+			thermo_capability["configuration"]["supportedModes"] = Json::Value(Json::arrayValue);
+			thermo_capability["configuration"]["supportedModes"].append("HEAT");
+			thermo_capability["configuration"]["supportedModes"].append("OFF");
+
+			endpoint["capabilities"].append(thermo_capability);
+			endpoint["capabilities"].append(CreateCapability("Alexa.EndpointHealth"));
+			endpoint["capabilities"].append(CreateCapability("Alexa"));
+
+			// Add cookie with metadata
+			endpoint["cookie"]["WhatAmI"] = "thermostat";
+			endpoint["cookie"]["sensorType"] = device_type;
+			endpoint["cookie"]["deviceName"] = device_name;
+			endpoint["cookie"]["setpointIdx"] = device_idx;
+
+			auto& components = thermostat_components[device_idx];
+			if (components.find("mode") != components.end())
+			{
+				endpoint["cookie"]["modeIdx"] = components["mode"];
+			}
+
+			root["event"]["payload"]["endpoints"].append(endpoint);
+		}
+		// Handle temperature and environmental sensors (including thermostats)
+		else if (device_type == pTypeTEMP || device_type == pTypeTEMP_HUM || device_type == pTypeHUM ||
 		         device_type == pTypeTEMP_HUM_BARO || device_type == pTypeTEMP_BARO)
 		{
 			std::string sensor_idx = device_idx;
 			std::string sensor_name = device_name;
 			int sensor_type = device_type;
 
-		// Determine description and category based on sensor type
-		std::string description, category;
-		if (sensor_type == pTypeHUM)
-		{
-			description = "Humidity Sensor";
-			category = "OTHER";
-		}
-		else
-		{
-			description = "Temperature Sensor";
-			category = "TEMPERATURE_SENSOR";
-		}
+			// Check if this is a thermostat (has linked setpoint)
+			bool is_thermostat = (thermostat_components.find(device_idx) != thermostat_components.end());
 
-		Json::Value endpoint = CreateEndpoint("sensor_" + sensor_idx, sensor_name, description, category);
+			// Determine description and category based on sensor type
+			std::string description, category;
+			if (is_thermostat)
+			{
+				description = "Thermostat";
+				category = "THERMOSTAT";
+			}
+			else if (sensor_type == pTypeHUM)
+			{
+				description = "Humidity Sensor";
+				category = "OTHER";
+			}
+			else
+			{
+				description = "Temperature Sensor";
+				category = "TEMPERATURE_SENSOR";
+			}
 
-		endpoint["capabilities"] = Json::Value(Json::arrayValue);
+			Json::Value endpoint = CreateEndpoint("sensor_" + sensor_idx, sensor_name, description, category);
 
-		// Add TemperatureSensor for Temp and Temp+Hum devices
-		if (sensor_type == pTypeTEMP || sensor_type == pTypeTEMP_HUM || sensor_type == pTypeTEMP_HUM_BARO || sensor_type == pTypeTEMP_BARO)
-		{
-			endpoint["capabilities"].append(CreateCapabilityWithProperties("Alexa.TemperatureSensor", "temperature", false, true));
-		}
+			endpoint["capabilities"] = Json::Value(Json::arrayValue);
 
-		// Add HumiditySensor for Temp+Hum and humidity-only sensors
-		if (sensor_type == pTypeTEMP_HUM || sensor_type == pTypeTEMP_HUM_BARO || sensor_type == pTypeHUM)
-		{
-			endpoint["capabilities"].append(CreateCapabilityWithProperties("Alexa.HumiditySensor", "relativeHumidity", false, true));
-		}
+			// Add ThermostatController for thermostats
+			if (is_thermostat)
+			{
+				Json::Value thermo_capability = CreateCapabilityWithProperties("Alexa.ThermostatController", "targetSetpoint", false, true);
 
-		endpoint["capabilities"].append(CreateCapability("Alexa.EndpointHealth"));
-		endpoint["capabilities"].append(CreateCapability("Alexa"));
+				// Add thermostatMode to supported properties
+				thermo_capability["properties"]["supported"].append(Json::Value());
+				thermo_capability["properties"]["supported"][1]["name"] = "thermostatMode";
 
-		// Add cookie with metadata
-		endpoint["cookie"]["WhatAmI"] = "sensor";
-		endpoint["cookie"]["sensorType"] = sensor_type;
-		endpoint["cookie"]["deviceName"] = sensor_name;
+				// Add configuration for supported modes
+				thermo_capability["configuration"]["supportsScheduling"] = false;
+				thermo_capability["configuration"]["supportedModes"] = Json::Value(Json::arrayValue);
+				thermo_capability["configuration"]["supportedModes"].append("HEAT");
+				thermo_capability["configuration"]["supportedModes"].append("OFF");
 
-		root["event"]["payload"]["endpoints"].append(endpoint);
+				endpoint["capabilities"].append(thermo_capability);
+			}
+
+			// Add TemperatureSensor for Temp and Temp+Hum devices
+			if (sensor_type == pTypeTEMP || sensor_type == pTypeTEMP_HUM || sensor_type == pTypeTEMP_HUM_BARO || sensor_type == pTypeTEMP_BARO)
+			{
+				endpoint["capabilities"].append(CreateCapabilityWithProperties("Alexa.TemperatureSensor", "temperature", false, true));
+			}
+
+			// Add HumiditySensor for Temp+Hum and humidity-only sensors, or if thermostat has linked humidity
+			if (sensor_type == pTypeTEMP_HUM || sensor_type == pTypeTEMP_HUM_BARO || sensor_type == pTypeHUM ||
+			    (is_thermostat && thermostat_components[device_idx].find("humidity") != thermostat_components[device_idx].end()))
+			{
+				endpoint["capabilities"].append(CreateCapabilityWithProperties("Alexa.HumiditySensor", "relativeHumidity", false, true));
+			}
+
+			endpoint["capabilities"].append(CreateCapability("Alexa.EndpointHealth"));
+			endpoint["capabilities"].append(CreateCapability("Alexa"));
+
+			// Add cookie with metadata
+			endpoint["cookie"]["WhatAmI"] = is_thermostat ? "thermostat" : "sensor";
+			endpoint["cookie"]["sensorType"] = sensor_type;
+			endpoint["cookie"]["deviceName"] = sensor_name;
+
+			// Add thermostat component indices
+			if (is_thermostat)
+			{
+				auto& components = thermostat_components[device_idx];
+				endpoint["cookie"]["setpointIdx"] = components["setpoint"];
+				if (components.find("mode") != components.end())
+				{
+					endpoint["cookie"]["modeIdx"] = components["mode"];
+				}
+				if (components.find("humidity") != components.end())
+				{
+					endpoint["cookie"]["humidityIdx"] = components["humidity"];
+				}
+			}
+
+			root["event"]["payload"]["endpoints"].append(endpoint);
 		}
 	}
 
@@ -1155,6 +1337,141 @@ static void Alexa_HandleControl_ColorTemperatureController(WebEmSession& session
 	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "ColorTemperatureController only supports SetColorTemperature/IncreaseColorTemperature/DecreaseColorTemperature");
 }
 
+static void Alexa_HandleControl_ThermostatController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
+{
+	Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
+	std::string setpoint_idx_str = cookie.get("setpointIdx", "").asString();
+
+	if (directive_name == "SetTargetTemperature")
+	{
+		double target_temp = request_json["directive"]["payload"]["targetSetpoint"]["value"].asDouble();
+
+		// Send setpoint command to Domoticz
+		m_mainworker.SetSetPoint(setpoint_idx_str, static_cast<float>(target_temp));
+
+		// Build response with updated targetSetpoint
+		Json::Value temp_value;
+		temp_value["value"] = target_temp;
+		temp_value["scale"] = "CELSIUS";
+		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", temp_value));
+
+		// Add thermostatMode (query from mode selector if available)
+		std::string mode = "HEAT"; // Default
+		std::string mode_idx_str = cookie.get("modeIdx", "").asString();
+		if (!mode_idx_str.empty())
+		{
+			uint64_t mode_idx = std::stoull(mode_idx_str);
+			std::vector<std::vector<std::string>> mode_result;
+			mode_result = m_sql.safe_query("SELECT nValue FROM DeviceStatus WHERE (ID = %llu)", mode_idx);
+			if (!mode_result.empty())
+			{
+				int level = atoi(mode_result[0][0].c_str());
+				mode = (level == 0) ? "OFF" : "HEAT";
+			}
+		}
+		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "thermostatMode", mode));
+
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	if (directive_name == "AdjustTargetTemperature")
+	{
+		double delta = request_json["directive"]["payload"]["targetSetpointDelta"]["value"].asDouble();
+
+		// Query current setpoint
+		uint64_t setpoint_idx = std::stoull(setpoint_idx_str);
+		std::vector<std::vector<std::string>> result;
+		result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (ID = %llu)", setpoint_idx);
+		if (result.empty())
+		{
+			CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Setpoint device not found");
+			return;
+		}
+
+		double current_temp = atof(result[0][0].c_str());
+		double new_temp = current_temp + delta;
+
+		// Send setpoint command
+		m_mainworker.SetSetPoint(setpoint_idx_str, static_cast<float>(new_temp));
+
+		// Build response
+		Json::Value temp_value;
+		temp_value["value"] = new_temp;
+		temp_value["scale"] = "CELSIUS";
+		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", temp_value));
+
+		// Query and report current mode
+		std::string mode = "HEAT"; // Default
+		std::string mode_idx_str = cookie.get("modeIdx", "").asString();
+		if (!mode_idx_str.empty())
+		{
+			uint64_t mode_idx = std::stoull(mode_idx_str);
+			std::vector<std::vector<std::string>> mode_result;
+			mode_result = m_sql.safe_query("SELECT nValue FROM DeviceStatus WHERE (ID = %llu)", mode_idx);
+			if (!mode_result.empty())
+			{
+				int level = atoi(mode_result[0][0].c_str());
+				mode = (level == 0) ? "OFF" : "HEAT";
+			}
+		}
+		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "thermostatMode", mode));
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	if (directive_name == "SetThermostatMode")
+	{
+		std::string mode = request_json["directive"]["payload"]["thermostatMode"]["value"].asString();
+		std::string mode_idx_str = cookie.get("modeIdx", "").asString();
+
+		if (mode_idx_str.empty())
+		{
+			CreateErrorResponse(root, request_json, "NOT_SUPPORTED_IN_CURRENT_MODE", "Thermostat does not have mode control");
+			return;
+		}
+
+		// Map Alexa mode to selector level (0=OFF, 10=HEAT)
+		int level = (mode == "OFF") ? 0 : 10;
+
+		// Set the mode selector level
+		uint64_t mode_idx = std::stoull(mode_idx_str);
+		std::string switchcmd = (level == 0) ? "Off" : "Set Level";
+
+		_log.Log(LOG_STATUS, "User: %s setting thermostat mode selector %llu to level %d (mode=%s, cmd=%s) via Alexa",
+			session.username.c_str(), mode_idx, level, mode.c_str(), switchcmd.c_str());
+
+		if (m_mainworker.SwitchLight(mode_idx, switchcmd, level, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
+		{
+			CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Failed to set thermostat mode");
+			return;
+		}
+
+		// Build response
+		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "thermostatMode", mode));
+
+		// Query and report current setpoint
+		std::string setpoint_idx_str = cookie.get("setpointIdx", "").asString();
+		uint64_t setpoint_idx = std::stoull(setpoint_idx_str);
+		std::vector<std::vector<std::string>> result;
+		result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (ID = %llu)", setpoint_idx);
+		if (!result.empty())
+		{
+			double setpoint = atof(result[0][0].c_str());
+			Json::Value temp_value;
+			temp_value["value"] = setpoint;
+			temp_value["scale"] = "CELSIUS";
+			root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", temp_value));
+		}
+
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	// Unsupported directive
+	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "ThermostatController only supports SetTargetTemperature/AdjustTargetTemperature/SetThermostatMode");
+}
+
 static void Alexa_HandleControl_ModeController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
 {
 	if (directive_name == "SetMode")
@@ -1353,6 +1670,89 @@ static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::V
 			root["context"]["properties"].append(CreateProperty("Alexa.HumiditySensor", "relativeHumidity", (int)nValue));
 		}
 
+		// Check if this is a thermostat (has setpoint)
+		Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
+		std::string setpoint_idx_str = cookie.get("setpointIdx", "").asString();
+		if (!setpoint_idx_str.empty())
+		{
+			uint64_t setpoint_idx = std::stoull(setpoint_idx_str);
+			// Query setpoint value
+			std::vector<std::vector<std::string>> setpoint_result;
+			setpoint_result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (ID = %llu)", setpoint_idx);
+			if (!setpoint_result.empty())
+			{
+				double setpoint = atof(setpoint_result[0][0].c_str());
+				Json::Value setpoint_value;
+				setpoint_value["value"] = setpoint;
+				setpoint_value["scale"] = "CELSIUS";
+				root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", setpoint_value));
+			}
+
+			// Query thermostat mode from mode selector if available
+			std::string mode_idx_str = cookie.get("modeIdx", "").asString();
+			std::string mode = "HEAT"; // Default
+			if (!mode_idx_str.empty())
+			{
+				uint64_t mode_idx = std::stoull(mode_idx_str);
+				std::vector<std::vector<std::string>> mode_result;
+				mode_result = m_sql.safe_query("SELECT nValue FROM DeviceStatus WHERE (ID = %llu)", mode_idx);
+				if (!mode_result.empty())
+				{
+					int level = atoi(mode_result[0][0].c_str());
+					mode = (level == 0) ? "OFF" : "HEAT";
+				}
+			}
+			root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "thermostatMode", mode));
+
+			// Query humidity if linked
+			std::string humidity_idx_str = cookie.get("humidityIdx", "").asString();
+			if (!humidity_idx_str.empty())
+			{
+				uint64_t humidity_idx = std::stoull(humidity_idx_str);
+				std::vector<std::vector<std::string>> hum_result;
+				hum_result = m_sql.safe_query("SELECT nValue FROM DeviceStatus WHERE (ID = %llu)", humidity_idx);
+				if (!hum_result.empty())
+				{
+					int humidity = atoi(hum_result[0][0].c_str());
+					root["context"]["properties"].append(CreateProperty("Alexa.HumiditySensor", "relativeHumidity", humidity));
+				}
+			}
+		}
+
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	// Handle standalone setpoint thermostats
+	if (dType == pTypeSetpoint)
+	{
+		root["event"]["header"]["name"] = "StateReport";
+
+		// Query setpoint value from sValue
+		std::string sValue = result[0][4];
+		double setpoint = atof(sValue.c_str());
+		Json::Value setpoint_value;
+		setpoint_value["value"] = setpoint;
+		setpoint_value["scale"] = "CELSIUS";
+		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", setpoint_value));
+
+		// Query thermostat mode from mode selector if available
+		Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
+		std::string mode_idx_str = cookie.get("modeIdx", "").asString();
+		std::string mode = "HEAT"; // Default
+		if (!mode_idx_str.empty())
+		{
+			uint64_t mode_idx = std::stoull(mode_idx_str);
+			std::vector<std::vector<std::string>> mode_result;
+			mode_result = m_sql.safe_query("SELECT nValue FROM DeviceStatus WHERE (ID = %llu)", mode_idx);
+			if (!mode_result.empty())
+			{
+				int level = atoi(mode_result[0][0].c_str());
+				mode = (level == 0) ? "OFF" : "HEAT";
+			}
+		}
+		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "thermostatMode", mode));
+
 		root["context"]["properties"].append(CreateEndpointHealthProperty());
 		return;
 	}
@@ -1361,7 +1761,7 @@ static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::V
 	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "ReportState not supported for this device type");
 }
 
-static bool CheckDeviceAccess(CWebServer* server, const WebEmSession& session, uint64_t device_idx, bool& bControlPermitted)
+bool CWebServer::CheckDeviceAccess(const WebEmSession& session, uint64_t device_idx, bool& bControlPermitted)
 {
 	bControlPermitted = true;
 
@@ -1378,17 +1778,17 @@ static bool CheckDeviceAccess(CWebServer* server, const WebEmSession& session, u
 	case URIGHTS_SWITCHER:
 	{
 		// Find user and check device permissions
-		int iUser = server->FindUser(session.username.c_str());
-		if ((iUser < 0) || (iUser >= (int)server->m_users.size()))
+		int iUser = FindUser(session.username.c_str());
+		if ((iUser < 0) || (iUser >= (int)m_users.size()))
 			return false;
 
 		// If TotSensors is 0, user has access to all devices
-		if (server->m_users[iUser].TotSensors == 0)
+		if (m_users[iUser].TotSensors == 0)
 			return true;
 
 		// Check if device is in user's shared devices
 		std::vector<std::vector<std::string>> result =
-			m_sql.safe_query("SELECT COUNT(*) FROM SharedDevices WHERE (SharedUserID == '%d') AND (DeviceRowID == '%llu')", server->m_users[iUser].ID, device_idx);
+			m_sql.safe_query("SELECT COUNT(*) FROM SharedDevices WHERE (SharedUserID == '%d') AND (DeviceRowID == '%llu')", m_users[iUser].ID, device_idx);
 		return (!result.empty() && atoi(result[0][0].c_str()) > 0);
 	}
 
@@ -1397,6 +1797,59 @@ static bool CheckDeviceAccess(CWebServer* server, const WebEmSession& session, u
 		return false;
 	}
 }
+
+// Check access to multiple devices at once (for cookie-based device references)
+bool CWebServer::CheckDeviceAccess(const WebEmSession& session, const std::vector<uint64_t>& device_indices, bool& bControlPermitted)
+{
+	bControlPermitted = true;
+
+	if (device_indices.empty())
+		return true;
+
+	switch (session.rights)
+	{
+	case URIGHTS_ADMIN:
+		// Admin can access anything
+		return true;
+
+	case URIGHTS_VIEWER:
+		bControlPermitted = false;
+		[[fallthrough]];
+
+	case URIGHTS_SWITCHER:
+	{
+		// Find user and check device permissions
+		int iUser = FindUser(session.username.c_str());
+		if ((iUser < 0) || (iUser >= (int)m_users.size()))
+			return false;
+
+		// If TotSensors is 0, user has access to all devices
+		if (m_users[iUser].TotSensors == 0)
+			return true;
+
+		// Build IN clause for SQL query
+		std::stringstream ss;
+		ss << "SELECT COUNT(*) FROM SharedDevices WHERE (SharedUserID == '" << m_users[iUser].ID << "') AND DeviceRowID IN (";
+		for (size_t i = 0; i < device_indices.size(); i++)
+		{
+			if (i > 0) ss << ",";
+			ss << device_indices[i];
+		}
+		ss << ")";
+
+		std::vector<std::vector<std::string>> result = m_sql.safe_query(ss.str().c_str());
+		// User must have access to ALL devices
+		return (!result.empty() && atoi(result[0][0].c_str()) == (int)device_indices.size());
+	}
+
+	default:
+		// Invalid user rights
+		return false;
+	}
+}
+
+// Extract all device indices from cookie fields ending in "Idx" and validate access
+
 
 void CWebServer::Alexa_HandleControl(WebEmSession& session, const request& req, Json::Value& root)
 {
@@ -1446,9 +1899,22 @@ void CWebServer::Alexa_HandleControl(WebEmSession& session, const request& req, 
 		return;
 	}
 
-	// Check access control for devices
+	// Check access control for main device and all cookie-referenced devices
+	std::vector<uint64_t> device_indices = {device_idx};
+	for (const auto& key : cookie.getMemberNames())
+	{
+		if (key.length() > 3 && key.substr(key.length() - 3) == "Idx")
+		{
+			std::string idx_str = cookie[key].asString();
+			if (!idx_str.empty())
+			{
+				device_indices.push_back(std::stoull(idx_str));
+			}
+		}
+	}
+
 	bool bControlPermitted;
-	if (!CheckDeviceAccess(this, session, device_idx, bControlPermitted))
+	if (!CheckDeviceAccess(session, device_indices, bControlPermitted))
 	{
 		CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device not found or access denied");
 		return;
@@ -1477,6 +1943,7 @@ void CWebServer::Alexa_HandleControl(WebEmSession& session, const request& req, 
 		{"Alexa.BrightnessController", Alexa_HandleControl_BrightnessController},
 		{"Alexa.ColorController", Alexa_HandleControl_ColorController},
 		{"Alexa.ColorTemperatureController", Alexa_HandleControl_ColorTemperatureController},
+		{"Alexa.ThermostatController", Alexa_HandleControl_ThermostatController},
 		{"Alexa.ModeController", Alexa_HandleControl_ModeController}
 	};
 
