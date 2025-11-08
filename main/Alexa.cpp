@@ -10,6 +10,7 @@
 #include "../webserver/reply.hpp"
 #include "../httpclient/HTTPClient.h"
 #include "../hardware/hardwaretypes.h"
+#include "../hardware/ColorSwitch.h"
 #include <json/json.h>
 #include <sstream>
 #include <string>
@@ -118,6 +119,66 @@ static Json::Value CreateEndpointHealthProperty()
 	Json::Value health = CreateProperty("Alexa.EndpointHealth", "connectivity", health_value);
 	health["uncertaintyInMilliseconds"] = 0;
 	return health;
+}
+
+// Convert HSB (Hue 0-360, Saturation 0-1, Brightness 0-1) to RGB (0-255)
+static void HSBtoRGB(double hue, double saturation, double brightness, int& r, int& g, int& b)
+{
+	if (saturation == 0)
+	{
+		r = g = b = (int)(brightness * 255);
+		return;
+	}
+
+	double h = hue / 60.0;
+	int i = (int)h;
+	double f = h - i;
+	double p = brightness * (1.0 - saturation);
+	double q = brightness * (1.0 - saturation * f);
+	double t = brightness * (1.0 - saturation * (1.0 - f));
+
+	switch (i % 6)
+	{
+	case 0: r = (int)(brightness * 255); g = (int)(t * 255); b = (int)(p * 255); break;
+	case 1: r = (int)(q * 255); g = (int)(brightness * 255); b = (int)(p * 255); break;
+	case 2: r = (int)(p * 255); g = (int)(brightness * 255); b = (int)(t * 255); break;
+	case 3: r = (int)(p * 255); g = (int)(q * 255); b = (int)(brightness * 255); break;
+	case 4: r = (int)(t * 255); g = (int)(p * 255); b = (int)(brightness * 255); break;
+	case 5: r = (int)(brightness * 255); g = (int)(p * 255); b = (int)(q * 255); break;
+	}
+}
+
+// Convert RGB (0-255) to HSB (Hue 0-360, Saturation 0-1, Brightness 0-1)
+static void RGBtoHSB(int r, int g, int b, double& hue, double& saturation, double& brightness)
+{
+	double rd = r / 255.0;
+	double gd = g / 255.0;
+	double bd = b / 255.0;
+
+	double max_val = std::max({rd, gd, bd});
+	double min_val = std::min({rd, gd, bd});
+	double delta = max_val - min_val;
+
+	brightness = max_val;
+
+	if (delta == 0)
+	{
+		hue = 0;
+		saturation = 0;
+		return;
+	}
+
+	saturation = delta / max_val;
+
+	if (rd == max_val)
+		hue = 60.0 * (fmod(((gd - bd) / delta), 6.0));
+	else if (gd == max_val)
+		hue = 60.0 * (((bd - rd) / delta) + 2.0);
+	else
+		hue = 60.0 * (((rd - gd) / delta) + 4.0);
+
+	if (hue < 0)
+		hue += 360.0;
 }
 
 static void CreateErrorResponse(Json::Value& root, const Json::Value& request_json, const std::string& error_type, const std::string& error_message)
@@ -400,8 +461,13 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 			// Handle simple On/Off and Dimmer switches
 			else if (switch_type == STYPE_OnOff || switch_type == STYPE_Dimmer)
 			{
-				Json::Value endpoint = CreateEndpoint("switch_" + device_idx, device_name, 
-					(switch_type == STYPE_Dimmer) ? "Dimmable Light" : "Switch", "SWITCH");
+				// Check if this is a color device
+				bool has_color = (device_type == pTypeColorSwitch);
+				bool has_color_temp = (device_subtype == sTypeColor_RGB_CW_WW || device_subtype == sTypeColor_RGB_CW_WW_Z);
+
+				Json::Value endpoint = CreateEndpoint("switch_" + device_idx, device_name,
+					has_color ? "RGB Light" : ((switch_type == STYPE_Dimmer) ? "Dimmable Light" : "Switch"),
+					"LIGHT");
 
 				// Add PowerController capability
 				Json::Value power_capability = CreateCapabilityWithProperties("Alexa.PowerController", "powerState", false, true);
@@ -415,12 +481,27 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 					endpoint["capabilities"].append(brightness_capability);
 				}
 
+				// Add ColorController for RGB devices
+				if (has_color)
+				{
+					Json::Value color_capability = CreateCapabilityWithProperties("Alexa.ColorController", "color", false, true);
+					endpoint["capabilities"].append(color_capability);
+				}
+
+				// Add ColorTemperatureController for RGBWW/RGBWWZ devices
+				if (has_color_temp)
+				{
+					Json::Value color_temp_capability = CreateCapabilityWithProperties("Alexa.ColorTemperatureController", "colorTemperatureInKelvin", false, true);
+					endpoint["capabilities"].append(color_temp_capability);
+				}
+
 				endpoint["capabilities"].append(CreateCapability("Alexa"));
 
 				// Add cookie with metadata
 				endpoint["cookie"]["WhatAmI"] = "switch";
 				endpoint["cookie"]["switchtype"] = switch_type;
 				endpoint["cookie"]["deviceName"] = device_name;
+				endpoint["cookie"]["hasColor"] = has_color;
 
 				root["event"]["payload"]["endpoints"].append(endpoint);
 			}
@@ -773,7 +854,10 @@ static void Alexa_HandleControl_BrightnessController(WebEmSession& session, cons
 		int brightness = request_json["directive"]["payload"]["brightness"].asInt();
 		_log.Log(LOG_STATUS, "User: %s set dimmer %llu to %d%% via Alexa", session.username.c_str(), device_idx, brightness);
 
-		if (m_mainworker.SwitchLight(device_idx, "Set Level", brightness, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
+		// Use "Set Level" for brightness changes (works better with color devices)
+		// Use "Off" for zero brightness
+		std::string switchcmd = (brightness > 0) ? "Set Level" : "Off";
+		if (m_mainworker.SwitchLight(device_idx, switchcmd, brightness, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
 		{
 			CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
 			return;
@@ -815,7 +899,9 @@ static void Alexa_HandleControl_BrightnessController(WebEmSession& session, cons
 
 		_log.Log(LOG_STATUS, "User: %s adjusted dimmer %llu by %d%% to %d%% via Alexa", session.username.c_str(), device_idx, brightnessDelta, new_brightness);
 
-		if (m_mainworker.SwitchLight(device_idx, "Set Level", new_brightness, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
+		// Use "Set Level" for brightness changes, "Off" for zero
+		std::string switchcmd = (new_brightness > 0) ? "Set Level" : "Off";
+		if (m_mainworker.SwitchLight(device_idx, switchcmd, new_brightness, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
 		{
 			CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
 			return;
@@ -829,6 +915,197 @@ static void Alexa_HandleControl_BrightnessController(WebEmSession& session, cons
 
 	// Unsupported directive for BrightnessController
 	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "BrightnessController only supports SetBrightness/AdjustBrightness");
+}
+
+static void Alexa_HandleControl_ColorController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
+{
+	if (directive_name == "SetColor")
+	{
+		double hue = request_json["directive"]["payload"]["color"]["hue"].asDouble();
+		double saturation = request_json["directive"]["payload"]["color"]["saturation"].asDouble();
+		double color_brightness = request_json["directive"]["payload"]["color"]["brightness"].asDouble();
+
+		// Query current device brightness level (not the color brightness)
+		std::vector<std::vector<std::string>> result;
+		result = m_sql.safe_query("SELECT Type, SubType, SwitchType, nValue, sValue FROM DeviceStatus WHERE (ID = %llu)", device_idx);
+		if (result.empty())
+		{
+			CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device not found");
+			return;
+		}
+
+		unsigned char dType = atoi(result[0][0].c_str());
+		unsigned char dSubType = atoi(result[0][1].c_str());
+		_eSwitchType switchtype = (_eSwitchType)atoi(result[0][2].c_str());
+		unsigned char nValue = atoi(result[0][3].c_str());
+		std::string sValue = result[0][4];
+
+		std::string lstatus;
+		int current_level;
+		bool bHaveDimmer, bHaveGroupCmd;
+		int maxDimLevel;
+		GetLightStatus(dType, dSubType, switchtype, nValue, sValue, lstatus, current_level, bHaveDimmer, maxDimLevel, bHaveGroupCmd);
+
+		// Convert HSB to RGB (use color_brightness for the conversion, but preserve device level)
+		int r, g, b;
+		HSBtoRGB(hue, saturation, color_brightness, r, g, b);
+
+		_log.Log(LOG_STATUS, "User: %s set color of device %llu to H:%.1f S:%.2f (RGB: %d,%d,%d) via Alexa, keeping brightness at %d%%",
+			session.username.c_str(), device_idx, hue, saturation, r, g, b, current_level);
+
+		// Set color - preserve current device brightness level
+		_tColor color;
+		color.mode = ColorModeRGB;
+		color.r = r;
+		color.g = g;
+		color.b = b;
+
+		if (m_mainworker.SwitchLight(device_idx, "Set Color", current_level, color, false, 0, session.username) == MainWorker::SL_ERROR)
+		{
+			CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
+			return;
+		}
+
+		// Return color in response
+		Json::Value color_value;
+		color_value["hue"] = hue;
+		color_value["saturation"] = saturation;
+		color_value["brightness"] = color_brightness;
+
+		root["context"]["properties"].append(CreateProperty("Alexa.ColorController", "color", color_value));
+		root["context"]["properties"].append(CreateProperty("Alexa.BrightnessController", "brightness", current_level));
+		root["context"]["properties"].append(CreateProperty("Alexa.PowerController", "powerState", (current_level > 0) ? "ON" : "OFF"));
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	// Unsupported directive for ColorController
+	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "ColorController only supports SetColor");
+}
+
+static void Alexa_HandleControl_ColorTemperatureController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
+{
+	if (directive_name == "SetColorTemperature")
+	{
+		int color_temp_kelvin = request_json["directive"]["payload"]["colorTemperatureInKelvin"].asInt();
+
+		// Alexa supports 1000K to 10000K, but typical range is 2200K (warm) to 6500K (cool)
+		// Domoticz uses 0-255 for cool white and warm white levels
+		// Map Kelvin to CW/WW: lower K = more warm, higher K = more cool
+		// 2200K = 100% WW, 0% CW
+		// 6500K = 0% WW, 100% CW
+
+		int ww = 0, cw = 0;
+		if (color_temp_kelvin <= 2200)
+		{
+			ww = 255;
+			cw = 0;
+		}
+		else if (color_temp_kelvin >= 6500)
+		{
+			ww = 0;
+			cw = 255;
+		}
+		else
+		{
+			// Linear interpolation between 2200K and 6500K
+			double ratio = (color_temp_kelvin - 2200) / (6500.0 - 2200.0);
+			cw = (int)(ratio * 255);
+			ww = 255 - cw;
+		}
+
+		_log.Log(LOG_STATUS, "User: %s set color temperature of device %llu to %dK (CW:%d WW:%d) via Alexa",
+			session.username.c_str(), device_idx, color_temp_kelvin, cw, ww);
+
+		// Query current brightness
+		std::vector<std::vector<std::string>> result;
+		result = m_sql.safe_query("SELECT Type, SubType, SwitchType, nValue, sValue FROM DeviceStatus WHERE (ID = %llu)", device_idx);
+		if (result.empty())
+		{
+			CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device not found");
+			return;
+		}
+
+		unsigned char dType = atoi(result[0][0].c_str());
+		unsigned char dSubType = atoi(result[0][1].c_str());
+		_eSwitchType switchtype = (_eSwitchType)atoi(result[0][2].c_str());
+		unsigned char nValue = atoi(result[0][3].c_str());
+		std::string sValue = result[0][4];
+
+		std::string lstatus;
+		int current_level;
+		bool bHaveDimmer, bHaveGroupCmd;
+		int maxDimLevel;
+		GetLightStatus(dType, dSubType, switchtype, nValue, sValue, lstatus, current_level, bHaveDimmer, maxDimLevel, bHaveGroupCmd);
+
+		// Set color temperature using white mode
+		_tColor color;
+		color.mode = ColorModeWhite;
+		color.t = 0;  // Color temperature (not used in this mode)
+		color.cw = cw;
+		color.ww = ww;
+
+		if (m_mainworker.SwitchLight(device_idx, "Set Color", current_level, color, false, 0, session.username) == MainWorker::SL_ERROR)
+		{
+			CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
+			return;
+		}
+
+		root["context"]["properties"].append(CreateProperty("Alexa.ColorTemperatureController", "colorTemperatureInKelvin", color_temp_kelvin));
+		root["context"]["properties"].append(CreateProperty("Alexa.BrightnessController", "brightness", current_level));
+		root["context"]["properties"].append(CreateProperty("Alexa.PowerController", "powerState", (current_level > 0) ? "ON" : "OFF"));
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+	else if (directive_name == "DecreaseColorTemperature" || directive_name == "IncreaseColorTemperature")
+	{
+		// Query current color temperature from device
+		std::vector<std::vector<std::string>> result;
+		result = m_sql.safe_query("SELECT Color FROM DeviceStatus WHERE (ID = %llu)", device_idx);
+		if (result.empty() || result[0][0].empty())
+		{
+			CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Device not found or no color data");
+			return;
+		}
+
+		Json::Value color_json;
+		Json::Reader reader;
+		if (!reader.parse(result[0][0], color_json))
+		{
+			CreateErrorResponse(root, request_json, "INTERNAL_ERROR", "Failed to parse color data");
+			return;
+		}
+
+		int cw = color_json.get("cw", 0).asInt();
+		int ww = color_json.get("ww", 0).asInt();
+
+		// Convert CW/WW back to Kelvin
+		int current_kelvin;
+		if (cw == 0 && ww == 0)
+		{
+			current_kelvin = 4000; // Default middle value
+		}
+		else
+		{
+			double ratio = cw / 255.0;
+			current_kelvin = (int)(2200 + ratio * (6500 - 2200));
+		}
+
+		// Adjust by 500K
+		int new_kelvin = current_kelvin + ((directive_name == "IncreaseColorTemperature") ? 500 : -500);
+		if (new_kelvin < 2200) new_kelvin = 2200;
+		if (new_kelvin > 6500) new_kelvin = 6500;
+
+		// Recursively call SetColorTemperature
+		Json::Value new_request = request_json;
+		new_request["directive"]["header"]["name"] = "SetColorTemperature";
+		new_request["directive"]["payload"]["colorTemperatureInKelvin"] = new_kelvin;
+		Alexa_HandleControl_ColorTemperatureController(session, new_request, root, device_idx, "SetColorTemperature");
+		return;
+	}
+
+	// Unsupported directive for ColorTemperatureController
+	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "ColorTemperatureController only supports SetColorTemperature/IncreaseColorTemperature/DecreaseColorTemperature");
 }
 
 static void Alexa_HandleControl_ModeController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
@@ -933,6 +1210,57 @@ static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::V
 			if (switchtype == STYPE_Dimmer)
 			{
 				root["context"]["properties"].append(CreateProperty("Alexa.BrightnessController", "brightness", level));
+
+				// Add color for RGB devices
+				if (dType == pTypeColorSwitch)
+				{
+					// Query color from database
+					std::vector<std::vector<std::string>> color_result;
+					color_result = m_sql.safe_query("SELECT Color FROM DeviceStatus WHERE (ID = %llu)", device_idx);
+					if (!color_result.empty() && !color_result[0][0].empty())
+					{
+						Json::Value color_json;
+						Json::Reader reader;
+						if (reader.parse(color_result[0][0], color_json))
+						{
+							int r = color_json.get("r", 0).asInt();
+							int g = color_json.get("g", 0).asInt();
+							int b = color_json.get("b", 0).asInt();
+
+							// Convert RGB to HSB
+							double hue, saturation, brightness;
+							RGBtoHSB(r, g, b, hue, saturation, brightness);
+
+							Json::Value color_value;
+							color_value["hue"] = hue;
+							color_value["saturation"] = saturation;
+							color_value["brightness"] = brightness;
+
+							root["context"]["properties"].append(CreateProperty("Alexa.ColorController", "color", color_value));
+
+							// Add color temperature for RGBWW/RGBWWZ devices
+							if (dSubType == sTypeColor_RGB_CW_WW || dSubType == sTypeColor_RGB_CW_WW_Z)
+							{
+								int cw = color_json.get("cw", 0).asInt();
+								int ww = color_json.get("ww", 0).asInt();
+
+								// Convert CW/WW to Kelvin
+								int color_temp_kelvin;
+								if (cw == 0 && ww == 0)
+								{
+									color_temp_kelvin = 4000; // Default
+								}
+								else
+								{
+									double ratio = cw / 255.0;
+									color_temp_kelvin = (int)(2200 + ratio * (6500 - 2200));
+								}
+
+								root["context"]["properties"].append(CreateProperty("Alexa.ColorTemperatureController", "colorTemperatureInKelvin", color_temp_kelvin));
+							}
+						}
+					}
+				}
 			}
 
 			root["context"]["properties"].append(CreateEndpointHealthProperty());
@@ -1058,6 +1386,8 @@ void CWebServer::Alexa_HandleControl(WebEmSession& session, const request& req, 
 		{"Alexa.RangeController", Alexa_HandleControl_RangeController},
 		{"Alexa.PowerController", Alexa_HandleControl_PowerController},
 		{"Alexa.BrightnessController", Alexa_HandleControl_BrightnessController},
+		{"Alexa.ColorController", Alexa_HandleControl_ColorController},
+		{"Alexa.ColorTemperatureController", Alexa_HandleControl_ColorTemperatureController},
 		{"Alexa.ModeController", Alexa_HandleControl_ModeController}
 	};
 
