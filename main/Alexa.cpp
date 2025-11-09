@@ -646,6 +646,27 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 
 			root["event"]["payload"]["endpoints"].append(endpoint);
 		}
+		// Handle Evohome zones (single-device thermostats)
+		else if (device_type == pTypeEvohomeZone)
+		{
+			Json::Value endpoint = CreateEndpoint("zone_" + device_idx, device_name, "Thermostat", "THERMOSTAT");
+			endpoint["capabilities"] = Json::Value(Json::arrayValue);
+
+			// Add ThermostatController (setpoint only, no mode control)
+			Json::Value thermo_capability = CreateCapabilityWithProperties("Alexa.ThermostatController", "targetSetpoint", false, true);
+			thermo_capability["configuration"]["supportsScheduling"] = false;
+			endpoint["capabilities"].append(thermo_capability);
+
+			// Add TemperatureSensor (zones have current temperature)
+			endpoint["capabilities"].append(CreateCapabilityWithProperties("Alexa.TemperatureSensor", "temperature", false, true));
+			endpoint["capabilities"].append(CreateCapability("Alexa.EndpointHealth"));
+			endpoint["capabilities"].append(CreateCapability("Alexa"));
+
+			endpoint["cookie"]["WhatAmI"] = "evohome_zone";
+			endpoint["cookie"]["deviceName"] = device_name;
+
+			root["event"]["payload"]["endpoints"].append(endpoint);
+		}
 		// Handle temperature and environmental sensors (including thermostats)
 		else if (device_type == pTypeTEMP || device_type == pTypeTEMP_HUM || device_type == pTypeHUM ||
 		         device_type == pTypeTEMP_HUM_BARO || device_type == pTypeTEMP_BARO)
@@ -1337,25 +1358,33 @@ static void Alexa_HandleControl_ColorTemperatureController(WebEmSession& session
 	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "ColorTemperatureController only supports SetColorTemperature/IncreaseColorTemperature/DecreaseColorTemperature");
 }
 
-static void Alexa_HandleControl_ThermostatController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
+// Helper to report thermostat state (setpoint, mode, optional humidity)
+static void ReportThermostatState(Json::Value& root, const Json::Value& cookie, uint64_t setpoint_idx, bool is_evohome_zone, const std::string& setpoint_sValue = "")
 {
-	Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
-	std::string setpoint_idx_str = cookie.get("setpointIdx", "").asString();
-
-	if (directive_name == "SetTargetTemperature")
+	// Query and report setpoint
+	std::string sValue = setpoint_sValue;
+	if (sValue.empty())
 	{
-		double target_temp = request_json["directive"]["payload"]["targetSetpoint"]["value"].asDouble();
+		std::vector<std::vector<std::string>> setpoint_result;
+		setpoint_result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (ID = %llu)", setpoint_idx);
+		if (!setpoint_result.empty())
+		{
+			sValue = setpoint_result[0][0];
+		}
+	}
 
-		// Send setpoint command to Domoticz
-		m_mainworker.SetSetPoint(setpoint_idx_str, static_cast<float>(target_temp));
+	if (!sValue.empty())
+	{
+		double setpoint = atof(sValue.c_str());
+		Json::Value setpoint_value;
+		setpoint_value["value"] = setpoint;
+		setpoint_value["scale"] = "CELSIUS";
+		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", setpoint_value));
+	}
 
-		// Build response with updated targetSetpoint
-		Json::Value temp_value;
-		temp_value["value"] = target_temp;
-		temp_value["scale"] = "CELSIUS";
-		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", temp_value));
-
-		// Add thermostatMode (query from mode selector if available)
+	// Query and report mode (not for Evohome zones)
+	if (!is_evohome_zone)
+	{
 		std::string mode = "HEAT"; // Default
 		std::string mode_idx_str = cookie.get("modeIdx", "").asString();
 		if (!mode_idx_str.empty())
@@ -1370,6 +1399,41 @@ static void Alexa_HandleControl_ThermostatController(WebEmSession& session, cons
 			}
 		}
 		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "thermostatMode", mode));
+	}
+}
+
+static void Alexa_HandleControl_ThermostatController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
+{
+	Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
+	std::string what_am_i = cookie.get("WhatAmI", "").asString();
+	bool is_evohome_zone = (what_am_i == "evohome_zone");
+
+	if (directive_name == "SetTargetTemperature")
+	{
+		double target_temp = request_json["directive"]["payload"]["targetSetpoint"]["value"].asDouble();
+
+		if (is_evohome_zone)
+		{
+			// Use SetSetPointEvo for Evohome zones
+			std::string idx_str = std::to_string(device_idx);
+			m_mainworker.SetSetPointEvo(idx_str, static_cast<float>(target_temp), "", "");
+
+			// For Evohome, just report the new setpoint (no mode)
+			Json::Value temp_value;
+			temp_value["value"] = target_temp;
+			temp_value["scale"] = "CELSIUS";
+			root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", temp_value));
+		}
+		else
+		{
+			// Use regular SetSetPoint for multi-device thermostats
+			std::string setpoint_idx_str = cookie.get("setpointIdx", "").asString();
+			uint64_t setpoint_idx = std::stoull(setpoint_idx_str);
+			m_mainworker.SetSetPoint(setpoint_idx_str, static_cast<float>(target_temp));
+
+			// Report updated state (pass known setpoint to avoid redundant query)
+			ReportThermostatState(root, cookie, setpoint_idx, is_evohome_zone, std::to_string(target_temp));
+		}
 
 		root["context"]["properties"].append(CreateEndpointHealthProperty());
 		return;
@@ -1380,42 +1444,64 @@ static void Alexa_HandleControl_ThermostatController(WebEmSession& session, cons
 		double delta = request_json["directive"]["payload"]["targetSetpointDelta"]["value"].asDouble();
 
 		// Query current setpoint
-		uint64_t setpoint_idx = std::stoull(setpoint_idx_str);
-		std::vector<std::vector<std::string>> result;
-		result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (ID = %llu)", setpoint_idx);
-		if (result.empty())
+		double current_temp;
+		if (is_evohome_zone)
 		{
-			CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Setpoint device not found");
-			return;
+			std::vector<std::vector<std::string>> result;
+			result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (ID = %llu)", device_idx);
+			if (result.empty())
+			{
+				CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Zone not found");
+				return;
+			}
+			// Parse sValue: "temp;setpoint;status;until"
+			std::vector<std::string> values;
+			StringSplit(result[0][0], ";", values);
+			if (values.size() < 2)
+			{
+				CreateErrorResponse(root, request_json, "INTERNAL_ERROR", "Invalid zone data");
+				return;
+			}
+			current_temp = atof(values[1].c_str());
+		}
+		else
+		{
+			std::string setpoint_idx_str = cookie.get("setpointIdx", "").asString();
+			uint64_t setpoint_idx = std::stoull(setpoint_idx_str);
+			std::vector<std::vector<std::string>> result;
+			result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (ID = %llu)", setpoint_idx);
+			if (result.empty())
+			{
+				CreateErrorResponse(root, request_json, "NO_SUCH_ENDPOINT", "Setpoint device not found");
+				return;
+			}
+			current_temp = atof(result[0][0].c_str());
 		}
 
-		double current_temp = atof(result[0][0].c_str());
 		double new_temp = current_temp + delta;
 
 		// Send setpoint command
-		m_mainworker.SetSetPoint(setpoint_idx_str, static_cast<float>(new_temp));
-
-		// Build response
-		Json::Value temp_value;
-		temp_value["value"] = new_temp;
-		temp_value["scale"] = "CELSIUS";
-		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", temp_value));
-
-		// Query and report current mode
-		std::string mode = "HEAT"; // Default
-		std::string mode_idx_str = cookie.get("modeIdx", "").asString();
-		if (!mode_idx_str.empty())
+		if (is_evohome_zone)
 		{
-			uint64_t mode_idx = std::stoull(mode_idx_str);
-			std::vector<std::vector<std::string>> mode_result;
-			mode_result = m_sql.safe_query("SELECT nValue FROM DeviceStatus WHERE (ID = %llu)", mode_idx);
-			if (!mode_result.empty())
-			{
-				int level = atoi(mode_result[0][0].c_str());
-				mode = (level == 0) ? "OFF" : "HEAT";
-			}
+			std::string idx_str = std::to_string(device_idx);
+			m_mainworker.SetSetPointEvo(idx_str, static_cast<float>(new_temp), "", "");
+
+			// For Evohome, just report the new setpoint
+			Json::Value temp_value;
+			temp_value["value"] = new_temp;
+			temp_value["scale"] = "CELSIUS";
+			root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", temp_value));
 		}
-		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "thermostatMode", mode));
+		else
+		{
+			std::string setpoint_idx_str = cookie.get("setpointIdx", "").asString();
+			uint64_t setpoint_idx = std::stoull(setpoint_idx_str);
+			m_mainworker.SetSetPoint(setpoint_idx_str, static_cast<float>(new_temp));
+
+			// Report updated state (pass known setpoint to avoid redundant query)
+			ReportThermostatState(root, cookie, setpoint_idx, is_evohome_zone, std::to_string(new_temp));
+		}
+
 		root["context"]["properties"].append(CreateEndpointHealthProperty());
 		return;
 	}
@@ -1423,6 +1509,14 @@ static void Alexa_HandleControl_ThermostatController(WebEmSession& session, cons
 	if (directive_name == "SetThermostatMode")
 	{
 		std::string mode = request_json["directive"]["payload"]["thermostatMode"]["value"].asString();
+
+		if (is_evohome_zone)
+		{
+			CreateErrorResponse(root, request_json, "NOT_SUPPORTED_IN_CURRENT_MODE", "Evohome zones do not support mode control");
+			return;
+		}
+
+		// Multi-device thermostat mode control
 		std::string mode_idx_str = cookie.get("modeIdx", "").asString();
 
 		if (mode_idx_str.empty())
@@ -1447,22 +1541,10 @@ static void Alexa_HandleControl_ThermostatController(WebEmSession& session, cons
 			return;
 		}
 
-		// Build response
-		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "thermostatMode", mode));
-
-		// Query and report current setpoint
+		// Report updated state
 		std::string setpoint_idx_str = cookie.get("setpointIdx", "").asString();
 		uint64_t setpoint_idx = std::stoull(setpoint_idx_str);
-		std::vector<std::vector<std::string>> result;
-		result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (ID = %llu)", setpoint_idx);
-		if (!result.empty())
-		{
-			double setpoint = atof(result[0][0].c_str());
-			Json::Value temp_value;
-			temp_value["value"] = setpoint;
-			temp_value["scale"] = "CELSIUS";
-			root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", temp_value));
-		}
+		ReportThermostatState(root, cookie, setpoint_idx, false);
 
 		root["context"]["properties"].append(CreateEndpointHealthProperty());
 		return;
@@ -1676,33 +1758,7 @@ static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::V
 		if (!setpoint_idx_str.empty())
 		{
 			uint64_t setpoint_idx = std::stoull(setpoint_idx_str);
-			// Query setpoint value
-			std::vector<std::vector<std::string>> setpoint_result;
-			setpoint_result = m_sql.safe_query("SELECT sValue FROM DeviceStatus WHERE (ID = %llu)", setpoint_idx);
-			if (!setpoint_result.empty())
-			{
-				double setpoint = atof(setpoint_result[0][0].c_str());
-				Json::Value setpoint_value;
-				setpoint_value["value"] = setpoint;
-				setpoint_value["scale"] = "CELSIUS";
-				root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", setpoint_value));
-			}
-
-			// Query thermostat mode from mode selector if available
-			std::string mode_idx_str = cookie.get("modeIdx", "").asString();
-			std::string mode = "HEAT"; // Default
-			if (!mode_idx_str.empty())
-			{
-				uint64_t mode_idx = std::stoull(mode_idx_str);
-				std::vector<std::vector<std::string>> mode_result;
-				mode_result = m_sql.safe_query("SELECT nValue FROM DeviceStatus WHERE (ID = %llu)", mode_idx);
-				if (!mode_result.empty())
-				{
-					int level = atoi(mode_result[0][0].c_str());
-					mode = (level == 0) ? "OFF" : "HEAT";
-				}
-			}
-			root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "thermostatMode", mode));
+			ReportThermostatState(root, cookie, setpoint_idx, false);
 
 			// Query humidity if linked
 			std::string humidity_idx_str = cookie.get("humidityIdx", "").asString();
@@ -1728,30 +1784,41 @@ static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::V
 	{
 		root["event"]["header"]["name"] = "StateReport";
 
-		// Query setpoint value from sValue
+		// Use helper to report thermostat state (pass sValue to avoid redundant query)
 		std::string sValue = result[0][4];
-		double setpoint = atof(sValue.c_str());
-		Json::Value setpoint_value;
-		setpoint_value["value"] = setpoint;
-		setpoint_value["scale"] = "CELSIUS";
-		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", setpoint_value));
-
-		// Query thermostat mode from mode selector if available
 		Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
-		std::string mode_idx_str = cookie.get("modeIdx", "").asString();
-		std::string mode = "HEAT"; // Default
-		if (!mode_idx_str.empty())
+		ReportThermostatState(root, cookie, device_idx, false, sValue);
+
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	// Handle Evohome zones
+	if (dType == pTypeEvohomeZone)
+	{
+		root["event"]["header"]["name"] = "StateReport";
+
+		// Parse zone data from sValue: "temp;setpoint;status;until"
+		std::string sValue = result[0][4];
+		std::vector<std::string> values;
+		StringSplit(sValue, ";", values);
+
+		if (values.size() >= 2)
 		{
-			uint64_t mode_idx = std::stoull(mode_idx_str);
-			std::vector<std::vector<std::string>> mode_result;
-			mode_result = m_sql.safe_query("SELECT nValue FROM DeviceStatus WHERE (ID = %llu)", mode_idx);
-			if (!mode_result.empty())
-			{
-				int level = atoi(mode_result[0][0].c_str());
-				mode = (level == 0) ? "OFF" : "HEAT";
-			}
+			// Report current temperature
+			double temp = atof(values[0].c_str());
+			Json::Value temp_value;
+			temp_value["value"] = temp;
+			temp_value["scale"] = "CELSIUS";
+			root["context"]["properties"].append(CreateProperty("Alexa.TemperatureSensor", "temperature", temp_value));
+
+			// Report target setpoint
+			double setpoint = atof(values[1].c_str());
+			Json::Value setpoint_value;
+			setpoint_value["value"] = setpoint;
+			setpoint_value["scale"] = "CELSIUS";
+			root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", setpoint_value));
 		}
-		root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "thermostatMode", mode));
 
 		root["context"]["properties"].append(CreateEndpointHealthProperty());
 		return;
