@@ -554,6 +554,24 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 
 				root["event"]["payload"]["endpoints"].append(endpoint);
 			}
+			// Handle door locks
+			else if (switch_type == STYPE_DoorLock || switch_type == STYPE_DoorLockInverted)
+			{
+				Json::Value endpoint = CreateEndpoint("lock_" + device_idx, device_name, "Door Lock", "SMARTLOCK");
+
+				// Add LockController capability
+				Json::Value lock_capability = CreateCapabilityWithProperties("Alexa.LockController", "lockState", false, true);
+				endpoint["capabilities"] = Json::Value(Json::arrayValue);
+				endpoint["capabilities"].append(lock_capability);
+				endpoint["capabilities"].append(CreateCapability("Alexa"));
+
+				// Add cookie with metadata
+				endpoint["cookie"]["WhatAmI"] = "lock";
+				endpoint["cookie"]["switchtype"] = switch_type;
+				endpoint["cookie"]["deviceName"] = device_name;
+
+				root["event"]["payload"]["endpoints"].append(endpoint);
+			}
 			// Handle simple On/Off and Dimmer switches
 			else if (switch_type == STYPE_OnOff || switch_type == STYPE_Dimmer)
 			{
@@ -1595,6 +1613,35 @@ static void Alexa_HandleControl_ModeController(WebEmSession& session, const Json
 	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "ModeController only supports SetMode");
 }
 
+static void Alexa_HandleControl_LockController(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx, const std::string& directive_name)
+{
+	if (directive_name == "Lock" || directive_name == "Unlock")
+	{
+		Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
+		int switch_type = cookie["switchtype"].isInt() ? cookie["switchtype"].asInt() : atoi(cookie["switchtype"].asString().c_str());
+
+		// For normal locks: Lock = On, Unlock = Off
+		// For inverted locks: Lock = Off, Unlock = On
+		bool is_inverted = (switch_type == STYPE_DoorLockInverted);
+		std::string switchcmd = (directive_name == "Lock") ? (is_inverted ? "Off" : "On") : (is_inverted ? "On" : "Off");
+
+		_log.Log(LOG_STATUS, "User: %s set lock %llu to %s via Alexa", session.username.c_str(), device_idx, directive_name.c_str());
+
+		if (m_mainworker.SwitchLight(device_idx, switchcmd, 0, NoColor, false, 0, session.username) == MainWorker::SL_ERROR)
+		{
+			CreateErrorResponse(root, request_json, "ENDPOINT_UNREACHABLE", "Unable to control device - hardware communication error");
+			return;
+		}
+
+		std::string lock_state = (directive_name == "Lock") ? "LOCKED" : "UNLOCKED";
+		root["context"]["properties"].append(CreateProperty("Alexa.LockController", "lockState", lock_state));
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	CreateErrorResponse(root, request_json, "INVALID_DIRECTIVE", "LockController only supports Lock/Unlock");
+}
+
 static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::Value& request_json, Json::Value& root, uint64_t device_idx)
 {
 	Json::Value cookie = request_json["directive"]["endpoint"]["cookie"];
@@ -1643,6 +1690,18 @@ static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::V
 			 switchtype == STYPE_BlindsPercentageWithStop || switchtype == STYPE_BlindsWithStop)
 		{
 			root["context"]["properties"].append(CreateProperty("Alexa.RangeController", "rangeValue", level, "Blind.Lift"));
+			root["context"]["properties"].append(CreateEndpointHealthProperty());
+			return;
+		}
+		else if (switchtype == STYPE_DoorLock || switchtype == STYPE_DoorLockInverted)
+		{
+			// Door locks
+			bool is_inverted = (switchtype == STYPE_DoorLockInverted);
+			// For normal locks: On = Locked, Off = Unlocked
+			// For inverted locks: Off = Locked, On = Unlocked
+			bool is_locked = is_inverted ? (lstatus == "Off") : (lstatus != "Off");
+			std::string lock_state = is_locked ? "LOCKED" : "UNLOCKED";
+			root["context"]["properties"].append(CreateProperty("Alexa.LockController", "lockState", lock_state));
 			root["context"]["properties"].append(CreateEndpointHealthProperty());
 			return;
 		}
@@ -2011,7 +2070,8 @@ void CWebServer::Alexa_HandleControl(WebEmSession& session, const request& req, 
 		{"Alexa.ColorController", Alexa_HandleControl_ColorController},
 		{"Alexa.ColorTemperatureController", Alexa_HandleControl_ColorTemperatureController},
 		{"Alexa.ThermostatController", Alexa_HandleControl_ThermostatController},
-		{"Alexa.ModeController", Alexa_HandleControl_ModeController}
+		{"Alexa.ModeController", Alexa_HandleControl_ModeController},
+		{"Alexa.LockController", Alexa_HandleControl_LockController}
 	};
 
 	// Look up handler in dispatch map
