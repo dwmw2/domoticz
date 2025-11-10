@@ -99,6 +99,118 @@ static std::string GetISO8601Timestamp()
 	return std::string(szTmp);
 }
 
+// Map common units to Alexa unit types (metric only, plus percent)
+static std::string MapUnitToAlexaType(const std::string& unit)
+{
+	// Weight
+	if (unit == "kg") return "Weight.Kilograms";
+	if (unit == "g") return "Weight.Grams";
+
+	// Distance
+	if (unit == "m") return "Distance.Meters";
+	if (unit == "km") return "Distance.Kilometers";
+
+	// Volume
+	if (unit == "l" || unit == "L") return "Volume.Liters";
+
+	// Percent
+	if (unit == "%") return "Percent";
+
+	// Extended Alexa.Unit types
+	if (unit == "g/m³" || unit == "g/m3") return "Alexa.Unit.Density.GramsPerCubicMeter";
+	if (unit == "V") return "Alexa.Unit.ElectricPotential.Volts";
+	if (unit == "A") return "Alexa.Unit.ElectricCurrent.Amperes";
+	if (unit == "W") return "Alexa.Unit.Power.Watts";
+	if (unit == "kW") return "Alexa.Unit.Power.Kilowatts";
+	if (unit == "kWh") return "Alexa.Unit.Energy.KilowattHours";
+	if (unit == "°C" || unit == "C") return "Temperature.Celsius";
+	if (unit == "Pa") return "Alexa.Unit.Pressure.Pascals";
+	if (unit == "hPa") return "Alexa.Unit.Pressure.Hectopascals";
+	if (unit == "dB") return "Alexa.Unit.SoundPressure.Decibels";
+
+	return ""; // No mapping available
+}
+
+// Get appropriate range and precision for sensor unit
+static void GetSensorRange(const std::string& unit, double& min, double& max, double& precision)
+{
+	// Default values
+	min = 0;
+	max = 1000;
+	precision = 0.01;
+
+	// Weight
+	if (unit == "kg") { max = 500; precision = 0.01; }
+	else if (unit == "g") { max = 100000; precision = 1; }
+
+	// Distance
+	else if (unit == "m") { max = 1000; precision = 0.1; }
+	else if (unit == "km") { max = 100; precision = 0.01; }
+
+	// Volume
+	else if (unit == "l" || unit == "L") { max = 1000; precision = 0.1; }
+
+	// Percent
+	else if (unit == "%") { max = 100; precision = 0.1; }
+
+	// Electrical
+	else if (unit == "V") { max = 500; precision = 0.01; }
+	else if (unit == "A") { max = 100; precision = 0.01; }
+	else if (unit == "W") { max = 10000; precision = 1; }
+	else if (unit == "kW") { max = 100; precision = 0.01; }
+	else if (unit == "kWh") { max = 100000; precision = 0.01; }
+
+	// Temperature
+	else if (unit == "°C" || unit == "C") { min = -50; max = 100; precision = 0.1; }
+
+	// Pressure
+	else if (unit == "Pa") { max = 200000; precision = 1; }
+	else if (unit == "hPa") { max = 2000; precision = 0.1; }
+
+	// Sound
+	else if (unit == "dB") { max = 150; precision = 0.1; }
+
+	// Absolute humidity
+	else if (unit == "g/m³" || unit == "g/m3") { max = 50; precision = 0.01; }
+}
+
+// Get semantic instance name for sensor based on unit
+static std::string GetSensorInstanceName(const std::string& unit)
+{
+	// Electrical
+	if (unit == "V") return "Sensor.Voltage";
+	if (unit == "A") return "Sensor.Current";
+	if (unit == "W" || unit == "kW") return "Sensor.Power";
+	if (unit == "kWh") return "Sensor.Energy";
+
+	// Temperature
+	if (unit == "°C" || unit == "C") return "Sensor.Temperature";
+
+	// Pressure
+	if (unit == "Pa" || unit == "hPa") return "Sensor.Pressure";
+
+	// Sound
+	if (unit == "dB") return "Sensor.SoundLevel";
+
+	// Absolute humidity
+	if (unit == "g/m³" || unit == "g/m3") return "Sensor.AbsoluteHumidity";
+
+	// Distance
+	if (unit == "m" || unit == "km") return "Sensor.Distance";
+
+	// Weight
+	if (unit == "kg" || unit == "g") return "Sensor.Weight";
+
+	// Volume
+	if (unit == "l" || unit == "L") return "Sensor.Volume";
+
+	// Percent
+	if (unit == "%") return "Sensor.Percentage";
+
+	// Default
+	return "Sensor.Value";
+}
+
 static Json::Value CreateProperty(const std::string& ns, const std::string& name, const Json::Value& value, const std::string& instance = "")
 {
 	Json::Value prop;
@@ -277,7 +389,7 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 	if (m_users[iUser].userrights == URIGHTS_ADMIN)
 	{
 		devices_result = m_sql.safe_query(
-			"SELECT DISTINCT d.ID, d.Name, d.Type, d.SubType, d.SwitchType, d.Options "
+			"SELECT DISTINCT d.ID, d.Name, d.Type, d.SubType, d.SwitchType, d.Options, d.sValue "
 			"FROM DeviceStatus d "
 			"INNER JOIN DeviceToPlansMap p ON d.ID = p.DeviceRowID AND p.DevSceneType = 0 "
 			"WHERE d.Used = 1 "
@@ -288,7 +400,7 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 	{
 		unsigned long userID = m_users[iUser].ID;
 		devices_result = m_sql.safe_query(
-			"SELECT DISTINCT d.ID, d.Name, d.Type, d.SubType, d.SwitchType, d.Options "
+			"SELECT DISTINCT d.ID, d.Name, d.Type, d.SubType, d.SwitchType, d.Options, d.sValue "
 			"FROM DeviceStatus d "
 			"INNER JOIN SharedDevices s ON d.ID = s.DeviceRowID "
 			"INNER JOIN DeviceToPlansMap p ON d.ID = p.DeviceRowID AND p.DevSceneType = 0 "
@@ -396,6 +508,7 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 		int device_subtype = atoi(device_row[3].c_str());
 		int switch_type = atoi(device_row[4].c_str());
 		std::string options_str = device_row[5];
+		std::string sValue = device_row[6];
 
 		// Skip devices that are part of thermostat groupings
 		if (linked_devices.find(device_idx) != linked_devices.end())
@@ -771,6 +884,99 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 					endpoint["cookie"]["humidityIdx"] = components["humidity"];
 				}
 			}
+
+			root["event"]["payload"]["endpoints"].append(endpoint);
+		}
+		// Handle Weight sensors
+		else if (device_type == pTypeWEIGHT)
+		{
+			Json::Value endpoint = CreateEndpoint("weight_" + device_idx, device_name, "Weight Sensor", "OTHER");
+			endpoint["capabilities"] = Json::Value(Json::arrayValue);
+
+			// Add RangeController for weight (read-only)
+			Json::Value weight_capability = CreateCapabilityWithProperties("Alexa.RangeController", "rangeValue", false, true);
+			weight_capability["instance"] = "Weight.Weight";
+			weight_capability["capabilityResources"]["friendlyNames"] = CreateFriendlyNames("Weight");
+			weight_capability["properties"]["nonControllable"] = true;
+			weight_capability["configuration"]["supportedRange"]["minimumValue"] = 0;
+			weight_capability["configuration"]["supportedRange"]["maximumValue"] = 500;
+			weight_capability["configuration"]["supportedRange"]["precision"] = 0.01;
+			weight_capability["configuration"]["unitOfMeasure"] = "Weight.Kilograms";
+
+			endpoint["capabilities"].append(weight_capability);
+			endpoint["capabilities"].append(CreateCapability("Alexa.EndpointHealth"));
+			endpoint["capabilities"].append(CreateCapability("Alexa"));
+
+			endpoint["cookie"]["WhatAmI"] = "weight";
+			endpoint["cookie"]["deviceName"] = device_name;
+
+			root["event"]["payload"]["endpoints"].append(endpoint);
+		}
+		// Handle General sensors (custom sensors with various units)
+		else if (device_type == pTypeGeneral)
+		{
+			// Exclude non-numeric sensor types
+			if (device_subtype == sTypeTextStatus ||
+			    device_subtype == sTypeSetPoint ||
+#ifdef WITH_OPENZWAVE
+			    device_subtype == sTypeZWaveThermostatMode ||
+			    device_subtype == sTypeZWaveThermostatFanMode ||
+			    device_subtype == sTypeZWaveThermostatOperatingState ||
+			    device_subtype == sTypeZWaveAlarm ||
+#endif
+			    device_subtype == sTypeAlert ||
+			    device_subtype == sTypeCounterIncremental ||
+			    device_subtype == sTypeManagedCounter)
+			{
+				continue;
+			}
+
+			// Parse unit from sValue (format: "value unit")
+			std::string unit;
+			size_t space_pos = sValue.find(' ');
+			if (space_pos != std::string::npos && space_pos + 1 < sValue.length())
+			{
+				unit = sValue.substr(space_pos + 1);
+			}
+
+			std::string alexa_unit = MapUnitToAlexaType(unit);
+
+			// Skip sensors with unmapped units
+			if (alexa_unit.empty())
+			{
+				_log.Log(LOG_STATUS, "(Alexa) Skipping General sensor '%s' (idx %s) with unsupported unit: %s",
+					device_name.c_str(), device_idx.c_str(), unit.c_str());
+				continue;
+			}
+
+			// Get appropriate range for this sensor type
+			double min_value, max_value, precision;
+			GetSensorRange(unit, min_value, max_value, precision);
+
+			// Get semantic instance name
+			std::string instance_name = GetSensorInstanceName(unit);
+
+			Json::Value endpoint = CreateEndpoint("general_" + device_idx, device_name, "Sensor", "OTHER");
+			endpoint["capabilities"] = Json::Value(Json::arrayValue);
+
+			// Add RangeController for general sensor (read-only)
+			Json::Value sensor_capability = CreateCapabilityWithProperties("Alexa.RangeController", "rangeValue", false, true);
+			sensor_capability["instance"] = instance_name;
+			sensor_capability["capabilityResources"]["friendlyNames"] = CreateFriendlyNames(device_name);
+			sensor_capability["properties"]["nonControllable"] = true;
+			sensor_capability["configuration"]["supportedRange"]["minimumValue"] = min_value;
+			sensor_capability["configuration"]["supportedRange"]["maximumValue"] = max_value;
+			sensor_capability["configuration"]["supportedRange"]["precision"] = precision;
+
+			// Add unit
+			sensor_capability["configuration"]["unitOfMeasure"] = alexa_unit;
+
+			endpoint["capabilities"].append(sensor_capability);
+			endpoint["capabilities"].append(CreateCapability("Alexa.EndpointHealth"));
+			endpoint["capabilities"].append(CreateCapability("Alexa"));
+
+			endpoint["cookie"]["WhatAmI"] = "general";
+			endpoint["cookie"]["deviceName"] = device_name;
 
 			root["event"]["payload"]["endpoints"].append(endpoint);
 		}
@@ -1879,6 +2085,45 @@ static void Alexa_HandleControl_ReportState(WebEmSession& session, const Json::V
 			root["context"]["properties"].append(CreateProperty("Alexa.ThermostatController", "targetSetpoint", setpoint_value));
 		}
 
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	// Handle Weight sensors
+	if (dType == pTypeWEIGHT)
+	{
+		root["event"]["header"]["name"] = "StateReport";
+
+		// Parse weight value from sValue (in kg)
+		std::string sValue = result[0][4];
+		double weight = atof(sValue.c_str());
+
+		root["context"]["properties"].append(CreateProperty("Alexa.RangeController", "rangeValue", weight, "Weight.Weight"));
+		root["context"]["properties"].append(CreateEndpointHealthProperty());
+		return;
+	}
+
+	// Handle General sensors
+	if (dType == pTypeGeneral)
+	{
+		root["event"]["header"]["name"] = "StateReport";
+
+		// Parse sensor value and unit from sValue
+		std::string sValue = result[0][4];
+		double value = atof(sValue.c_str());
+
+		// Parse unit from sValue (format: "value unit")
+		std::string unit;
+		size_t space_pos = sValue.find(' ');
+		if (space_pos != std::string::npos && space_pos + 1 < sValue.length())
+		{
+			unit = sValue.substr(space_pos + 1);
+		}
+
+		// Get semantic instance name
+		std::string instance_name = GetSensorInstanceName(unit);
+
+		root["context"]["properties"].append(CreateProperty("Alexa.RangeController", "rangeValue", value, instance_name));
 		root["context"]["properties"].append(CreateEndpointHealthProperty());
 		return;
 	}
