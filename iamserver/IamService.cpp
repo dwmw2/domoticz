@@ -29,16 +29,11 @@ namespace http
 
 		std::string GetIssuerFromRequest(const request &req, const std::string &configured_realm)
 		{
-			// Only use Host header if the configured realm uses the default 'domoticz.local'
-			if (configured_realm.find("domoticz.local") != std::string::npos)
+			// Use Host header to determine the issuer
+			const char *host_header = request::get_req_header(&req, "Host");
+			if (host_header != nullptr)
 			{
-				const char *host_header = request::get_req_header(&req, "Host");
-				if (host_header != nullptr)
-				{
-					// Infer scheme from configured realm or default to http
-					std::string scheme = (configured_realm.find("https://") == 0) ? "https://" : "http://";
-					return scheme + std::string(host_header) + "/";
-				}
+				return "https://" + std::string(host_header) + "/";
 			}
 			return configured_realm;
 		}
