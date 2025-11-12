@@ -29,7 +29,7 @@ static Json::Value CreateCapability(const std::string& intf)
 	return capability;
 }
 
-static Json::Value CreateCapabilityWithProperties(const std::string& intf, const std::string& property_name, bool proactivelyReported, bool retrievable)
+static Json::Value CreateCapabilityWithProperties(const std::string& intf, const std::string& property_name, bool proactivelyReported, bool retrievable, bool nonControllable = false)
 {
 	Json::Value capability = CreateCapability(intf);
 	capability["properties"]["supported"] = Json::Value(Json::arrayValue);
@@ -38,6 +38,8 @@ static Json::Value CreateCapabilityWithProperties(const std::string& intf, const
 	capability["properties"]["supported"].append(prop);
 	capability["properties"]["proactivelyReported"] = proactivelyReported;
 	capability["properties"]["retrievable"] = retrievable;
+	if (nonControllable)
+		capability["properties"]["nonControllable"] = true;
 	return capability;
 }
 
@@ -384,6 +386,9 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 		return;
 	}
 
+	// Determine if user has control permissions (only SWITCHER and ADMIN can control)
+	bool bControlPermitted = (session.rights == URIGHTS_SWITCHER || session.rights == URIGHTS_ADMIN);
+
 	// Get devices - all devices for admin, shared devices for regular users
 	std::vector<std::vector<std::string>> devices_result;
 	if (m_users[iUser].userrights == URIGHTS_ADMIN)
@@ -533,7 +538,7 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 				instance_name += ".Mode";
 
 				// Add ModeController capability
-				Json::Value mode_capability = CreateCapabilityWithProperties("Alexa.ModeController", "mode", false, true);
+				Json::Value mode_capability = CreateCapabilityWithProperties("Alexa.ModeController", "mode", false, true, !bControlPermitted);
 				mode_capability["instance"] = instance_name;
 
 				// Add capability resources (friendly names for the capability itself)
@@ -596,7 +601,7 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 				bool has_stop = (switch_type == STYPE_BlindsPercentageWithStop || switch_type == STYPE_BlindsWithStop);
 
 				// Add RangeController capability for blind position
-				Json::Value range_capability = CreateCapabilityWithProperties("Alexa.RangeController", "rangeValue", false, has_percentage);
+				Json::Value range_capability = CreateCapabilityWithProperties("Alexa.RangeController", "rangeValue", false, has_percentage, !bControlPermitted);
 				range_capability["instance"] = "Blind.Lift";
 
 				// Add capability resources using Alexa assets
@@ -654,7 +659,7 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 				// Add PowerController if blind has stop button
 				if (has_stop)
 				{
-					Json::Value power_capability = CreateCapabilityWithProperties("Alexa.PowerController", "powerState", false, false);
+					Json::Value power_capability = CreateCapabilityWithProperties("Alexa.PowerController", "powerState", false, false, !bControlPermitted);
 					endpoint["capabilities"].append(power_capability);
 				}
 
@@ -673,7 +678,7 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 				Json::Value endpoint = CreateEndpoint("lock_" + device_idx, device_name, "Door Lock", "SMARTLOCK");
 
 				// Add LockController capability
-				Json::Value lock_capability = CreateCapabilityWithProperties("Alexa.LockController", "lockState", false, true);
+				Json::Value lock_capability = CreateCapabilityWithProperties("Alexa.LockController", "lockState", false, true, !bControlPermitted);
 				endpoint["capabilities"] = Json::Value(Json::arrayValue);
 				endpoint["capabilities"].append(lock_capability);
 				endpoint["capabilities"].append(CreateCapability("Alexa"));
@@ -697,28 +702,28 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 					"LIGHT");
 
 				// Add PowerController capability
-				Json::Value power_capability = CreateCapabilityWithProperties("Alexa.PowerController", "powerState", false, true);
+				Json::Value power_capability = CreateCapabilityWithProperties("Alexa.PowerController", "powerState", false, true, !bControlPermitted);
 				endpoint["capabilities"] = Json::Value(Json::arrayValue);
 				endpoint["capabilities"].append(power_capability);
 
 				// Add BrightnessController for dimmers
 				if (switch_type == STYPE_Dimmer)
 				{
-					Json::Value brightness_capability = CreateCapabilityWithProperties("Alexa.BrightnessController", "brightness", false, true);
+					Json::Value brightness_capability = CreateCapabilityWithProperties("Alexa.BrightnessController", "brightness", false, true, !bControlPermitted);
 					endpoint["capabilities"].append(brightness_capability);
 				}
 
 				// Add ColorController for RGB devices
 				if (has_color)
 				{
-					Json::Value color_capability = CreateCapabilityWithProperties("Alexa.ColorController", "color", false, true);
+					Json::Value color_capability = CreateCapabilityWithProperties("Alexa.ColorController", "color", false, true, !bControlPermitted);
 					endpoint["capabilities"].append(color_capability);
 				}
 
 				// Add ColorTemperatureController for RGBWW/RGBWWZ devices
 				if (has_color_temp)
 				{
-					Json::Value color_temp_capability = CreateCapabilityWithProperties("Alexa.ColorTemperatureController", "colorTemperatureInKelvin", false, true);
+					Json::Value color_temp_capability = CreateCapabilityWithProperties("Alexa.ColorTemperatureController", "colorTemperatureInKelvin", false, true, !bControlPermitted);
 					endpoint["capabilities"].append(color_temp_capability);
 				}
 
@@ -747,7 +752,7 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 			endpoint["capabilities"] = Json::Value(Json::arrayValue);
 
 			// Add ThermostatController
-			Json::Value thermo_capability = CreateCapabilityWithProperties("Alexa.ThermostatController", "targetSetpoint", false, true);
+			Json::Value thermo_capability = CreateCapabilityWithProperties("Alexa.ThermostatController", "targetSetpoint", false, true, !bControlPermitted);
 
 			// Add thermostatMode to supported properties
 			thermo_capability["properties"]["supported"].append(Json::Value());
@@ -784,7 +789,7 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 			endpoint["capabilities"] = Json::Value(Json::arrayValue);
 
 			// Add ThermostatController (setpoint only, no mode control)
-			Json::Value thermo_capability = CreateCapabilityWithProperties("Alexa.ThermostatController", "targetSetpoint", false, true);
+			Json::Value thermo_capability = CreateCapabilityWithProperties("Alexa.ThermostatController", "targetSetpoint", false, true, !bControlPermitted);
 			thermo_capability["configuration"]["supportsScheduling"] = false;
 			endpoint["capabilities"].append(thermo_capability);
 
@@ -834,7 +839,7 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 			// Add ThermostatController for thermostats
 			if (is_thermostat)
 			{
-				Json::Value thermo_capability = CreateCapabilityWithProperties("Alexa.ThermostatController", "targetSetpoint", false, true);
+				Json::Value thermo_capability = CreateCapabilityWithProperties("Alexa.ThermostatController", "targetSetpoint", false, true, !bControlPermitted);
 
 				// Add thermostatMode to supported properties
 				thermo_capability["properties"]["supported"].append(Json::Value());
@@ -1004,6 +1009,8 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 			// Add SceneController capability
 			Json::Value scene_capability = CreateCapability("Alexa.SceneController");
 			scene_capability["supportsDeactivation"] = false;
+			if (!bControlPermitted)
+				scene_capability["proactivelyReported"] = false;
 
 			endpoint["capabilities"] = Json::Value(Json::arrayValue);
 			endpoint["capabilities"].append(scene_capability);
@@ -1011,7 +1018,7 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 		else // Group
 		{
 			// Add PowerController capability
-			Json::Value power_capability = CreateCapabilityWithProperties("Alexa.PowerController", "powerState", false, true);
+			Json::Value power_capability = CreateCapabilityWithProperties("Alexa.PowerController", "powerState", false, true, !bControlPermitted);
 
 			endpoint["capabilities"] = Json::Value(Json::arrayValue);
 			endpoint["capabilities"].append(power_capability);
