@@ -396,7 +396,6 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 		devices_result = m_sql.safe_query(
 			"SELECT DISTINCT d.ID, d.Name, d.Type, d.SubType, d.SwitchType, d.Options, d.sValue "
 			"FROM DeviceStatus d "
-			"INNER JOIN DeviceToPlansMap p ON d.ID = p.DeviceRowID AND p.DevSceneType = 0 "
 			"WHERE d.Used = 1 "
 			"AND d.ID NOT IN (SELECT DeviceRowID FROM DeviceToPlansMap WHERE PlanID IN (SELECT ID FROM Plans WHERE Name = '$Hidden Devices') AND DevSceneType = 0) "
 			"ORDER BY d.ID");
@@ -408,7 +407,6 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 			"SELECT DISTINCT d.ID, d.Name, d.Type, d.SubType, d.SwitchType, d.Options, d.sValue "
 			"FROM DeviceStatus d "
 			"INNER JOIN SharedDevices s ON d.ID = s.DeviceRowID "
-			"INNER JOIN DeviceToPlansMap p ON d.ID = p.DeviceRowID AND p.DevSceneType = 0 "
 			"WHERE s.SharedUserID = %lu AND d.Used = 1 "
 			"AND d.ID NOT IN (SELECT DeviceRowID FROM DeviceToPlansMap WHERE PlanID IN (SELECT ID FROM Plans WHERE Name = '$Hidden Devices') AND DevSceneType = 0) "
 			"ORDER BY d.ID",
@@ -987,12 +985,11 @@ void CWebServer::Alexa_HandleDiscovery(WebEmSession& session, const request& req
 		}
 	}
 
-	// Get scenes/groups that are in room plans and not protected
+	// Get scenes/groups that are not protected
 	std::vector<std::vector<std::string>> scenes_result;
 	scenes_result = m_sql.safe_query(
 		"SELECT s.ID, s.Name, s.SceneType, s.Protected "
 		"FROM Scenes s "
-		"INNER JOIN DeviceToPlansMap d ON s.ID = d.DeviceRowID AND d.DevSceneType = 1 "
 		"WHERE s.Protected = 0 "
 		"ORDER BY s.Name");
 
