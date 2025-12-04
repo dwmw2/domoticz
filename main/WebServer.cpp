@@ -2224,19 +2224,17 @@ namespace http
 						double valuemin = (!value_min.empty()) ? atof(value_min.c_str()) : -200.0;
 						double valuemax = (!value_max.empty()) ? atof(value_max.c_str()) : 200.0;
 
-						if (
-							(value_unit.empty())
-							|| (value_unit == "°C")
-							|| (value_unit == "°F")
-							|| (value_unit == "C")
-							|| (value_unit == "F")
-							)
+						if (value_unit.empty())
 						{
 							if (tempsign == 'C')
 								value_unit = "°C";
 							else
 								value_unit = "°F";
 						}
+						else if (value_unit == "C")
+							value_unit = "°C";
+						else if (value_unit == "F")
+							value_unit = "°F";
 
 						root["result"][ii]["step"] = valuestep;
 						root["result"][ii]["min"] = valuemin;
@@ -2248,9 +2246,10 @@ namespace http
 						if (strarray.size() >= 2)
 						{
 							double tempCelcius = atof(strarray[0].c_str());
-							double temp = ConvertTemperature(tempCelcius, tempsign);
+							char device_tempsign = (value_unit == "°F" || value_unit == "F") ? 'F' : 'C';
+							double temp = ConvertTemperature(tempCelcius, device_tempsign);
 							double tempSetPointCelcius = atof(strarray[1].c_str());
-							double tempSetPoint = ConvertTemperature(tempSetPointCelcius, tempsign);
+							double tempSetPoint = ConvertTemperature(tempSetPointCelcius, device_tempsign);
 							root["result"][ii]["Temp"] = temp;
 							root["result"][ii]["SetPoint"] = tempSetPoint;
 
@@ -3219,21 +3218,26 @@ namespace http
 
 							double value = atof(sValue.c_str());
 
-							if (
-								(value_unit.empty())
-								|| (value_unit == "°C")
-								|| (value_unit == "°F")
-								|| (value_unit == "C")
-								|| (value_unit == "F")
-								)
+							if (value_unit.empty())
 							{
 								if (tempsign == 'C')
 									value_unit = "°C";
 								else
 									value_unit = "°F";
+							}
+							else if (value_unit == "C")
+								value_unit = "°C";
+							else if (value_unit == "F")
+								value_unit = "°F";
 
+							if (
+								(value_unit == "°C")
+								|| (value_unit == "°F")
+								)
+							{
+								char device_tempsign = (value_unit == "°F") ? 'F' : 'C';
 								double tempCelcius = value;
-								double temp = ConvertTemperature(tempCelcius, tempsign);
+								double temp = ConvertTemperature(tempCelcius, device_tempsign);
 
 								sprintf(szTmp, "%.1f", temp);
 							}
